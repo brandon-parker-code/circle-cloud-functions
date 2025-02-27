@@ -2,25 +2,12 @@
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore} from 'firebase-admin/firestore';
 import {onDocumentDeleted} from 'firebase-functions/v2/firestore';
-import * as v2 from 'firebase-functions/v2';
 import * as admin from 'firebase-admin';
 
 
-type Indexable = {[key: string]: any };
 initializeApp();
 const db = getFirestore();
 
-export const helloWorld = v2.https.onRequest((request, response) => {
-    // debugger;
-    const name = request.params[0];
-    const items: Indexable = {
-        lamp: 'This is a lamp',
-        chair: 'Good chair',
-    };
-    const message = items[name];
-
-    response.send(`<h1>${message}</h1>`);
-});
 
 /**
  * Gets the device token from the user document
@@ -72,15 +59,36 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
     return null;
 }
 
+/**
+ * deletes and entire sub collection
+ * @param {FirebaseFirestore.CollectionReference} collectionRef The collection reference
+ */
+async function deleteSubCollection(collectionRef: FirebaseFirestore.CollectionReference): Promise<void> {
+    const snapshot = await collectionRef.get();
+    await Promise.all(snapshot.docs.map(async (doc) => {
+        await doc.ref.delete();
+        console.log(`Deleted document ${doc.id} from sub-collection.`);
+    }));
+
+    Promise.resolve();
+}
+
+
 export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (event) => {
     const circleId = event.params.circleId;
     const deletedData = event.data?.data();
     const userId = deletedData?.userId;
+    const circleName = deletedData?.name;
 
     console.log(`Document with ID ${circleId} was deleted.`);
     console.log('Deleted data:', deletedData);
 
     try {
+        // Delete 'users' sub-collection under the deleted 'circles' document
+        const users1Ref = db.collection(`circles/${circleId}/users`);
+        await deleteSubCollection(users1Ref);
+        console.log(`All documents in 'users' sub-collection under circle ${circleId} deleted.`);
+
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
         const usersSnapshot = await db.collection('users').get();
 
@@ -101,7 +109,7 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         const deviceToken = await getDeviceToken(userId);
         // Send a notification to the user
         if (deviceToken) {
-            await sendPushNotification(deviceToken, 'Cicle Notification', 'Your circle has been deleted.');
+            await sendPushNotification(deviceToken, 'Circle Deleted', `Circle ${circleName} has been deleted.`);
         }
 
         // Optional: Handle other tasks that may need to be done asynchronously
@@ -109,9 +117,8 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         console.error(`Error during circle deletion operation for circleId: ${circleId}`, error);
     }
 
-    return null;
+    return Promise.resolve();
 });
-
 
 export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{userId}', async (event) => {
     const circleId = event.params.circleId;
@@ -143,7 +150,7 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
 
         // Send a notification to the user
         if (deviceToken) {
-            await sendPushNotification(deviceToken, 'Cicle Notification', 'You have been removed from circle.');
+            await sendPushNotification(deviceToken, 'Removed from circle', 'You have been removed from a circle.');
         }
 
         // Optional: Handle other tasks that may need to be done asynchronously
@@ -151,5 +158,5 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
         console.error(`Error during circle user deletion operation for circleId: ${circleId} userId: ${userId}`, error);
     }
 
-    return null;
+    return Promise.resolve();
 });
