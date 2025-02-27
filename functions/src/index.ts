@@ -3,6 +3,8 @@ import {initializeApp} from 'firebase-admin/app';
 import {getFirestore} from 'firebase-admin/firestore';
 import {onDocumentDeleted} from 'firebase-functions/v2/firestore';
 import * as v2 from 'firebase-functions/v2';
+import * as admin from 'firebase-admin';
+
 
 type Indexable = {[key: string]: any };
 initializeApp();
@@ -24,11 +26,24 @@ export const helloWorld = v2.https.onRequest((request, response) => {
 export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (event) => {
     const circleId = event.params.circleId;
     const deletedData = event.data?.data();
+    const userId = deletedData?.userId;
 
     console.log(`Document with ID ${circleId} was deleted.`);
     console.log('Deleted data:', deletedData);
 
+
     try {
+        // Get the user document where the userId matches
+        const userQuerySnapshot = await db.collection('users').where('userId', '==', userId).get();
+
+        if (userQuerySnapshot.empty) {
+            console.warn(`No user found with userId: ${userId}`);
+            return;
+        }
+
+        const userDoc = userQuerySnapshot.docs[0]; // Assuming userId is unique
+        const deviceToken = userDoc.data().deviceToken;
+
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
         const usersSnapshot = await db.collection('users').get();
 
@@ -44,6 +59,18 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
                 console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
             }));
         }));
+
+        if (deviceToken) {
+            const message = {
+                token: deviceToken,
+                notification: {
+                    title: 'Circle Notification',
+                    body: 'Your circle has been deleted.',
+                },
+            };
+
+            await admin.messaging().send(message);
+        }
 
         // Optional: Handle other tasks that may need to be done asynchronously
     } catch (error) {
