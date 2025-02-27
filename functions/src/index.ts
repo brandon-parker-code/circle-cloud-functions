@@ -22,6 +22,55 @@ export const helloWorld = v2.https.onRequest((request, response) => {
     response.send(`<h1>${message}</h1>`);
 });
 
+/**
+ * Gets the device token from the user document
+ * @param {string} userId The userId field
+ * @return {Promise<string> | null} The deviceToken or null
+ */
+async function getDeviceToken(userId: string): Promise<string | null> {
+    try {
+        const userQuerySnapshot = await db.collection('users').where('userId', '==', userId).get();
+
+        if (userQuerySnapshot.empty) {
+            console.warn(`No user found with userId: ${userId}`);
+            return null;
+        }
+
+        const userDoc = userQuerySnapshot.docs[0]; // Assuming userId is unique
+        const deviceToken = userDoc.data().deviceToken;
+
+        console.log(`Found user document with ID: ${userDoc.id}`);
+        console.log(`Device Token: ${deviceToken}`);
+
+        return deviceToken || null;
+    } catch (error) {
+        console.error(`Error fetching device token for user ${userId}:`, error);
+        return null;
+    }
+}
+
+/**
+ * Sends a Push Notification to the device
+ * @param {string} deviceToken The users deviceToken
+ * @param {string} title The notification title
+ * @param {string} body The notification body
+ * @return {Promise<string> | null} The deviceToken or null
+ */
+async function sendPushNotification(deviceToken: string, title: string, body: string) : Promise<string | null> {
+    if (deviceToken) {
+        const message = {
+            token: deviceToken,
+            notification: {
+                title: title,
+                body: body,
+            },
+        };
+
+        return await admin.messaging().send(message);
+    }
+
+    return null;
+}
 
 export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (event) => {
     const circleId = event.params.circleId;
@@ -31,19 +80,7 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
     console.log(`Document with ID ${circleId} was deleted.`);
     console.log('Deleted data:', deletedData);
 
-
     try {
-        // Get the user document where the userId matches
-        const userQuerySnapshot = await db.collection('users').where('userId', '==', userId).get();
-
-        if (userQuerySnapshot.empty) {
-            console.warn(`No user found with userId: ${userId}`);
-            return;
-        }
-
-        const userDoc = userQuerySnapshot.docs[0]; // Assuming userId is unique
-        const deviceToken = userDoc.data().deviceToken;
-
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
         const usersSnapshot = await db.collection('users').get();
 
@@ -60,16 +97,11 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
             }));
         }));
 
+        // Get the user document where the userId matches
+        const deviceToken = await getDeviceToken(userId);
+        // Send a notification to the user
         if (deviceToken) {
-            const message = {
-                token: deviceToken,
-                notification: {
-                    title: 'Circle Notification',
-                    body: 'Your circle has been deleted.',
-                },
-            };
-
-            await admin.messaging().send(message);
+            await sendPushNotification(deviceToken, 'Cicle Notification', 'Your circle has been deleted.');
         }
 
         // Optional: Handle other tasks that may need to be done asynchronously
@@ -105,6 +137,14 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
                 console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
             }));
         }));
+
+        // Get the user document where the userId matches
+        const deviceToken = await getDeviceToken(userId);
+
+        // Send a notification to the user
+        if (deviceToken) {
+            await sendPushNotification(deviceToken, 'Cicle Notification', 'You have been removed from circle.');
+        }
 
         // Optional: Handle other tasks that may need to be done asynchronously
     } catch (error) {
