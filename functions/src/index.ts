@@ -89,6 +89,11 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         await deleteSubCollection(users1Ref);
         console.log(`All documents in 'users' sub-collection under circle ${circleId} deleted.`);
 
+        // Delete 'locations' sub-collection under the deleted 'circles' document
+        const locationsRef = db.collection(`circles/${circleId}/locations`);
+        await deleteSubCollection(locationsRef);
+        console.log(`All documents in 'locations' sub-collection under circle ${circleId} deleted.`);
+
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
         const usersSnapshot = await db.collection('users').get();
 
