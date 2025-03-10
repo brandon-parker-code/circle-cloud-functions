@@ -1,13 +1,11 @@
 /* eslint-disable max-len */
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore} from 'firebase-admin/firestore';
-import {onDocumentDeleted} from 'firebase-functions/v2/firestore';
+import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
 import * as admin from 'firebase-admin';
-
 
 initializeApp();
 const db = getFirestore();
-
 
 /**
  * Gets the device token from the user document
@@ -53,6 +51,7 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
             },
         };
 
+        console.log(message);
         return await admin.messaging().send(message);
     }
 
@@ -73,7 +72,6 @@ async function deleteSubCollection(collectionRef: FirebaseFirestore.CollectionRe
     Promise.resolve();
 }
 
-
 export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (event) => {
     const circleId = event.params.circleId;
     const deletedData = event.data?.data();
@@ -88,11 +86,6 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         const users1Ref = db.collection(`circles/${circleId}/users`);
         await deleteSubCollection(users1Ref);
         console.log(`All documents in 'users' sub-collection under circle ${circleId} deleted.`);
-
-        // Delete 'locations' sub-collection under the deleted 'circles' document
-        const locationsRef = db.collection(`circles/${circleId}/locations`);
-        await deleteSubCollection(locationsRef);
-        console.log(`All documents in 'locations' sub-collection under circle ${circleId} deleted.`);
 
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
         const usersSnapshot = await db.collection('users').get();
@@ -161,6 +154,36 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
         // Optional: Handle other tasks that may need to be done asynchronously
     } catch (error) {
         console.error(`Error during circle user deletion operation for circleId: ${circleId} userId: ${userId}`, error);
+    }
+
+    return Promise.resolve();
+});
+
+export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', async (event) => {
+    const snapshot = event.data;
+    if (!snapshot) {
+        console.log('No data associated with the event.');
+        return;
+    }
+
+    const eventData = snapshot.data();
+
+    const userId = eventData.userId;
+    const userName = eventData.userName;
+    const eventName = eventData.eventName;
+    const state = eventData.state;
+
+    const id = event.params.id;
+    console.log(`New location event created: ${id}`, eventData);
+    // Perform additional operations, such as notifying users, logging, etc.
+
+    // Get the user document where the userId matches
+    const deviceToken = await getDeviceToken(userId);
+
+    const action = state == 'entered' ? 'arriving' : 'leaving';
+    // Send a notification to the user
+    if (deviceToken) {
+        await sendPushNotification(deviceToken, 'Location', `${userName} is ${action} at ${eventName}.`);
     }
 
     return Promise.resolve();
