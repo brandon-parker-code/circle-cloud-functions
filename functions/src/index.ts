@@ -88,20 +88,20 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         console.log(`All documents in 'users' sub-collection under circle ${circleId} deleted.`);
 
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
-        const usersSnapshot = await db.collection('users').get();
+        // const usersSnapshot = await db.collection('users').get();
 
-        // Use Promise.all to process all users and their sub-collection deletions asynchronously
-        await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
-            // Check the 'circles' sub-collection for matching documents
-            const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
-            const circles2Snapshot = await circles2Ref.get();
+        // // Use Promise.all to process all users and their sub-collection deletions asynchronously
+        // await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
+        //     // Check the 'circles' sub-collection for matching documents
+        //     const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
+        //     const circles2Snapshot = await circles2Ref.get();
 
-            // Loop over the found 'circles' documents and delete them
-            await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
-                await circles2Doc.ref.delete();
-                console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
-            }));
-        }));
+        //     // Loop over the found 'circles' documents and delete them
+        //     await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
+        //         await circles2Doc.ref.delete();
+        //         console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
+        //     }));
+        // }));
 
         // Get the user document where the userId matches
         const deviceToken = await getDeviceToken(userId);
@@ -128,20 +128,20 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
 
     try {
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
-        const usersSnapshot = await db.collection('users').get();
+        // const usersSnapshot = await db.collection('users').get();
 
-        // Use Promise.all to process all users and their sub-collection deletions asynchronously
-        await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
-            // Check the 'circles' sub-collection for matching documents
-            const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
-            const circles2Snapshot = await circles2Ref.get();
+        // // Use Promise.all to process all users and their sub-collection deletions asynchronously
+        // await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
+        //     // Check the 'circles' sub-collection for matching documents
+        //     const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
+        //     const circles2Snapshot = await circles2Ref.get();
 
-            // Loop over the found 'circles' documents and delete them
-            await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
-                await circles2Doc.ref.delete();
-                console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
-            }));
-        }));
+        //     // Loop over the found 'circles' documents and delete them
+        //     await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
+        //         await circles2Doc.ref.delete();
+        //         console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
+        //     }));
+        // }));
 
         // Get the user document where the userId matches
         const deviceToken = await getDeviceToken(userId);
