@@ -1,11 +1,36 @@
 /* eslint-disable max-len */
 import {initializeApp} from 'firebase-admin/app';
-import {getFirestore} from 'firebase-admin/firestore';
+import {getFirestore, Timestamp} from 'firebase-admin/firestore';
 import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
 import * as admin from 'firebase-admin';
 
 initializeApp();
 const db = getFirestore();
+db.settings({ignoreUndefinedProperties: true});
+// Define the TypeScript interface for notifications
+interface LocationNotification {
+    title: string;
+    body: string;
+}
+
+interface TripNotification {
+    startTime: FirebaseFirestore.Timestamp;
+    endTime: FirebaseFirestore.Timestamp;
+    avgSpeed: number;
+    maxSpeed: number;
+    distance: number;
+    duration: number;
+}
+
+interface Notification {
+    id: string;
+    userId: string;
+    circleId: string;
+    userName: string;
+    tripNotification: TripNotification | undefined;
+    locationNotification: LocationNotification | undefined;
+    dateCreated: FirebaseFirestore.Timestamp;
+}
 
 /**
  * Gets the device token from the user document
@@ -87,20 +112,27 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         await deleteSubCollection(users1Ref);
         console.log(`All documents in 'users' sub-collection under circle ${circleId} deleted.`);
 
-        // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
+        // // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
         // const usersSnapshot = await db.collection('users').get();
 
         // // Use Promise.all to process all users and their sub-collection deletions asynchronously
         // await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
-        //     // Check the 'circles' sub-collection for matching documents
-        //     const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
-        //     const circles2Snapshot = await circles2Ref.get();
+        //     // Check the 'circleIds' list for matching documents
+        //     const userData = userDoc.data();
+        //     const circleIds = userData.circleIds;
+        //     const newCircleIds = circleIds.filter((i: string) => i !== circleId);
 
-        //     // Loop over the found 'circles' documents and delete them
-        //     await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
-        //         await circles2Doc.ref.delete();
-        //         console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
-        //     }));
+        //     console.log(`Updating circleIds to ${newCircleIds}`);
+        //     userDoc.ref.update({circleIds: newCircleIds});
+
+        //     //     const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
+        //     //     const circles2Snapshot = await circles2Ref.get();
+
+        // //     // Loop over the found 'circles' documents and delete them
+        // //     await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
+        // //         await circles2Doc.ref.delete();
+        // //         console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
+        // //     }));
         // }));
 
         // Get the user document where the userId matches
@@ -128,20 +160,30 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
 
     try {
         // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
-        // const usersSnapshot = await db.collection('users').get();
+        const usersSnapshot = await db.collection('users').get();
 
-        // // Use Promise.all to process all users and their sub-collection deletions asynchronously
-        // await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
-        //     // Check the 'circles' sub-collection for matching documents
-        //     const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
-        //     const circles2Snapshot = await circles2Ref.get();
+        // Use Promise.all to process all users and their sub-collection deletions asynchronously
+        await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
+            // Check the 'circles' sub-collection for matching documents
+            // const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
+            // const circles2Snapshot = await circles2Ref.get();
 
-        //     // Loop over the found 'circles' documents and delete them
-        //     await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
-        //         await circles2Doc.ref.delete();
-        //         console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
-        //     }));
-        // }));
+
+            // Check the 'circleIds' list for matching documents
+            const userData = userDoc.data();
+            const circleIds = userData.circleIds;
+            const newCircleIds = circleIds.filter((i: string) => i !== circleId);
+
+            console.log(`User: ${userId} current circleIds ${circleIds} new circleIds ${newCircleIds}`);
+            userDoc.ref.update({circleIds: newCircleIds});
+            console.log(`User: ${userId} circleIds updated`);
+
+            // // Loop over the found 'circles' documents and delete them
+            // await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
+            //     await circles2Doc.ref.delete();
+            //     console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
+            // }));
+        }));
 
         // Get the user document where the userId matches
         const deviceToken = await getDeviceToken(userId);
@@ -159,6 +201,7 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
     return Promise.resolve();
 });
 
+
 export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', async (event) => {
     const snapshot = event.data;
     if (!snapshot) {
@@ -167,24 +210,115 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
     }
 
     const eventData = snapshot.data();
-
     const userId = eventData.userId;
     const userName = eventData.userName;
     const eventName = eventData.eventName;
     const state = eventData.state;
+    const circleId = eventData.circleId;
 
     const id = event.params.id;
     console.log(`New location event created: ${id}`, eventData);
     // Perform additional operations, such as notifying users, logging, etc.
 
-    // Get the user document where the userId matches
-    const deviceToken = await getDeviceToken(userId);
+    // Reference the 'users' subcollection
+    const usersCollectionRef = db.collection(`circles/${circleId}/users`);
+    const usersSnapshot = await usersCollectionRef.get();
 
-    const action = state == 'entered' ? 'arriving' : 'leaving';
-    // Send a notification to the user
-    if (deviceToken) {
-        await sendPushNotification(deviceToken, 'Location', `${userName} is ${action} at ${eventName}.`);
+    if (usersSnapshot.empty) {
+        console.log(`No users found in circle ${circleId}`);
+        return;
     }
 
+    // Process each user document asynchronously
+    const userPromises = usersSnapshot.docs.map(async (doc) => {
+        const userData = doc.data();
+
+        // Get the user document where the userId matches
+        // const deviceToken = await getDeviceToken(userId);
+        console.log(`Processing user ${userData.id} in circle ${circleId}:`);
+        const action = state == 'entered' ? 'arriving' : 'leaving';
+
+        // Create notificaiton\message title and body
+        const title = 'Location';
+        const body = `${userName} is ${action} at ${eventName}.`;
+
+        // Create a new document reference to get the ID before writing
+        const notificationRef = db.collection(`users/${userData.id}/notifications`).doc();
+
+        // Create a location notification object with strong typing
+        const locationNotification: LocationNotification = {
+            title: title,
+            body: body,
+        };
+
+        // Create the notification object with strong typing
+        const notificationData: Notification = {
+            id: notificationRef.id, // Store the generated ID
+            userId: userId, // userId for the user that generated the event
+            circleId: circleId, // The circleId
+            userName: userName, // userName for the ser that generated th even
+            tripNotification: undefined, // set undefined
+            locationNotification: locationNotification, // Message Title
+            dateCreated: Timestamp.now(), // Firestore timestamp
+        };
+
+        // Insert into user's 'notifications' subcollection
+        notificationRef.set(notificationData);
+
+        // Get the user document where the userId matches
+        const deviceToken = await getDeviceToken(userData.id);
+        // Send a notification to the user
+        if (deviceToken) {
+            await sendPushNotification(deviceToken, title, body);
+        }
+
+        // Example: Update user document (modify as needed)
+        return doc.ref.update({processed: true});
+    });
+
+    // Wait for all updates to complete
+    await Promise.all(userPromises);
+
+    return Promise.resolve();
+});
+
+export const onTripCreated = onDocumentCreated('users/{userId}/trips/{tripId}', async (event) => {
+    const snapshot = event.data;
+    if (!snapshot) {
+        console.log('No data associated with the event.');
+        return;
+    }
+    const eventData = snapshot.data();
+    const userId = event.params.userId;
+
+    // Create a new document reference to get the ID before writing
+    const notificationRef = db.collection(`users/${userId}/notifications`).doc();
+
+    // Create a trip notification object with strong typing
+    const tripNotification: TripNotification = {
+        startTime: eventData.startTime,
+        endTime: eventData.endTime,
+        avgSpeed: eventData.avgSpeed,
+        maxSpeed: eventData.maxSpeed,
+        distance: eventData.distance,
+        duration: eventData.duration,
+    };
+
+    // Create the notification object with strong typing
+    const notificationData: Notification = {
+        id: notificationRef.id, // Store the generated ID
+        userId: userId, // userId for the user that generated the event
+        circleId: 'circleId', // The circleId
+        userName: eventData.name, // userName for the ser that generated th even
+        tripNotification: tripNotification, // set undefined
+        locationNotification: undefined, // Message Title
+        dateCreated: Timestamp.now(), // Firestore timestamp
+    };
+
+    // Insert into user's 'notifications' subcollection
+    notificationRef.set(notificationData);
+
+
+    console.log(`Processing Notification Trip data for user ${userId}`);
     return Promise.resolve();
 });
