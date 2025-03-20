@@ -1,8 +1,11 @@
 /* eslint-disable max-len */
+// import * as functions from 'firebase-functions';
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
 import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
+// import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
+// import {getStorage} from 'firebase-admin/storage';
 
 initializeApp();
 const db = getFirestore();
@@ -11,9 +14,12 @@ db.settings({ignoreUndefinedProperties: true});
 interface LocationNotification {
     title: string;
     body: string;
+    address: string;
+    state: string;
+    eventName: string;
 }
 
-interface TripNotification {
+interface TrackNotification {
     startTime: FirebaseFirestore.Timestamp;
     endTime: FirebaseFirestore.Timestamp;
     avgSpeed: number;
@@ -27,7 +33,7 @@ interface Notification {
     userId: string;
     circleId: string;
     userName: string;
-    tripNotification: TripNotification | undefined;
+    trackNotification: TrackNotification | undefined;
     locationNotification: LocationNotification | undefined;
     dateCreated: FirebaseFirestore.Timestamp;
 }
@@ -215,6 +221,8 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
     const eventName = eventData.eventName;
     const state = eventData.state;
     const circleId = eventData.circleId;
+    const address = eventData.address;
+
 
     const id = event.params.id;
     console.log(`New location event created: ${id}`, eventData);
@@ -249,6 +257,10 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
         const locationNotification: LocationNotification = {
             title: title,
             body: body,
+            address: address,
+            state: state,
+            eventName: eventName,
+
         };
 
         // Create the notification object with strong typing
@@ -257,7 +269,7 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
             userId: userId, // userId for the user that generated the event
             circleId: circleId, // The circleId
             userName: userName, // userName for the ser that generated th even
-            tripNotification: undefined, // set undefined
+            trackNotification: undefined, // set undefined
             locationNotification: locationNotification, // Message Title
             dateCreated: Timestamp.now(), // Firestore timestamp
         };
@@ -282,7 +294,7 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
     return Promise.resolve();
 });
 
-export const onTripCreated = onDocumentCreated('users/{userId}/trips/{tripId}', async (event) => {
+export const onTrackCreated = onDocumentCreated('users/{userId}/tracks/{trackId}', async (event) => {
     const snapshot = event.data;
     if (!snapshot) {
         console.log('No data associated with the event.');
@@ -294,8 +306,8 @@ export const onTripCreated = onDocumentCreated('users/{userId}/trips/{tripId}', 
     // Create a new document reference to get the ID before writing
     const notificationRef = db.collection(`users/${userId}/notifications`).doc();
 
-    // Create a trip notification object with strong typing
-    const tripNotification: TripNotification = {
+    // Create a track notification object with strong typing
+    const trackNotification: TrackNotification = {
         startTime: eventData.startTime,
         endTime: eventData.endTime,
         avgSpeed: eventData.avgSpeed,
@@ -310,7 +322,7 @@ export const onTripCreated = onDocumentCreated('users/{userId}/trips/{tripId}', 
         userId: userId, // userId for the user that generated the event
         circleId: 'circleId', // The circleId
         userName: eventData.name, // userName for the ser that generated th even
-        tripNotification: tripNotification, // set undefined
+        trackNotification: trackNotification, // set undefined
         locationNotification: undefined, // Message Title
         dateCreated: Timestamp.now(), // Firestore timestamp
     };
@@ -319,6 +331,31 @@ export const onTripCreated = onDocumentCreated('users/{userId}/trips/{tripId}', 
     notificationRef.set(notificationData);
 
 
-    console.log(`Processing Notification Trip data for user ${userId}`);
+    console.log(`Processing Notification Track data for user ${userId}`);
     return Promise.resolve();
 });
+
+
+// export const eventhandler = onCustomEventPublished("firebase.extensions.storage-resize-images.v1.onSuccess", async (event) => {
+//     // Handle extension event here.
+
+//     functions.logger.info("Resize Image is successful", event);
+
+//     const fileBucket = event.data.input.bucket;
+//     const name = event.data.input.name;
+//     const compressName = event.data.outputs[0].outputFilePath;
+
+
+//     console.log(`bucket: ${fileBucket} name: ${name}  compressed: ${compressName}`);
+//     // const bucket = firebase.Storage().ref.bucket(fileBucket);
+//     const bucket = admin.storage().bucket(fileBucket);
+//     // rename the original file temporarily
+//     await bucket.file(name).rename(name + '.tmp');
+//     await bucket.file(compressName).rename(name);
+//     await bucket.file(name + '.tmp').delete();
+
+//     // var desertRef = storageRef.child('images/desert.jpg');
+
+//     // Additional operations based on the event data can be performed here
+//     return Promise.resolve();
+// });
