@@ -38,6 +38,20 @@ interface Notification {
     dateCreated: FirebaseFirestore.Timestamp;
 }
 
+interface CircleUser {
+    id: string;
+    role: string;
+    authorization: string;
+}
+
+interface Circle {
+    id: string;
+    name: string;
+    ownerId: string;
+    dateCreated: Timestamp;
+    users: [CircleUser] | undefined
+}
+
 /**
  * Gets the device token from the user document
  * @param {string} userId The userId field
@@ -216,7 +230,7 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
     }
 
     const eventData = snapshot.data();
-    const userId = eventData.userId;
+    // const userId = eventData.userId;
     const userName = eventData.userName;
     const eventName = eventData.eventName;
     const state = eventData.state;
@@ -229,29 +243,54 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
     // Perform additional operations, such as notifying users, logging, etc.
 
     // Reference the 'users' subcollection
-    const usersCollectionRef = db.collection(`circles/${circleId}/users`);
-    const usersSnapshot = await usersCollectionRef.get();
+    const circleCollectionRef = db.collection('circles').doc(`${circleId}`);
+    const circleSnapshot = await circleCollectionRef.get();
 
-    if (usersSnapshot.empty) {
-        console.log(`No users found in circle ${circleId}`);
+    if (!circleSnapshot.exists) {
+        console.log(`No circle found ${circleId}`);
         return;
     }
 
-    // Process each user document asynchronously
-    const userPromises = usersSnapshot.docs.map(async (doc) => {
-        const userData = doc.data();
+    const data = circleSnapshot.data();
+    if (!data) {
+        console.error('Data is undefined or null.');
+        return null;
+    }
 
+    // Convert Firestore Timestamp to JavaScript Date
+    const circle: Circle = {
+        id: circleSnapshot.id,
+        name: data.name || '', // Ensure name is a string
+        ownerId: data.ownerId || '', // Ensure ownerId is a string
+        dateCreated: data.dateCreated, // Handle Timestamp conversion
+        users: data.users.map((user: CircleUser) => ({
+            id: user.id || '', // Ensure id is a string
+            role: user.role || '', // Ensure role is a string
+            authorization: user.authorization || '', // Ensure authorization is a string
+        })),
+    };
+
+
+    console.log(circle);
+
+    if (!circle.users) {
+        console.error('No user data.');
+        return null;
+    }
+
+    // Process each user document asynchronously
+    const userPromises = circle.users.map(async (user) => {
         // Get the user document where the userId matches
-        // const deviceToken = await getDeviceToken(userId);
-        console.log(`Processing user ${userData.id} in circle ${circleId}:`);
-        const action = state == 'entered' ? 'arriving' : 'leaving';
+        // const deviceToken = await getDeviceToken(user.id);
+        console.log(`Processing user ${user.id} in circle ${circle.id}:`);
+        const action = state == 'arrived' ? 'arriving' : 'leaving';
 
         // Create notificaiton\message title and body
         const title = 'Location';
-        const body = `${userName} is ${action} at ${eventName}.`;
+        const body = state == 'arrived' ? `${userName} is ${action} at ${eventName}.` : `${userName} is ${action} ${eventName}.`;
 
         // Create a new document reference to get the ID before writing
-        const notificationRef = db.collection(`users/${userData.id}/notifications`).doc();
+        const notificationRef = db.collection(`users/${user.id}/notifications`).doc();
 
         // Create a location notification object with strong typing
         const locationNotification: LocationNotification = {
@@ -260,13 +299,12 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
             address: address,
             state: state,
             eventName: eventName,
-
         };
 
         // Create the notification object with strong typing
         const notificationData: Notification = {
             id: notificationRef.id, // Store the generated ID
-            userId: userId, // userId for the user that generated the event
+            userId: user.id, // userId for the user that generated the event
             circleId: circleId, // The circleId
             userName: userName, // userName for the ser that generated th even
             trackNotification: undefined, // set undefined
@@ -278,14 +316,13 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
         notificationRef.set(notificationData);
 
         // Get the user document where the userId matches
-        const deviceToken = await getDeviceToken(userData.id);
+        const deviceToken = await getDeviceToken(user.id);
         // Send a notification to the user
         if (deviceToken) {
             await sendPushNotification(deviceToken, title, body);
         }
 
-        // Example: Update user document (modify as needed)
-        return doc.ref.update({processed: true});
+        return Promise.resolve();
     });
 
     // Wait for all updates to complete
