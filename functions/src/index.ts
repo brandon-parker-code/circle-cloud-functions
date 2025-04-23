@@ -2,7 +2,7 @@
 // import * as functions from 'firebase-functions';
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
-import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
+import {onDocumentCreated, onDocumentDeleted, onDocumentUpdated} from 'firebase-functions/v2/firestore';
 // import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
 // import {getStorage} from 'firebase-admin/storage';
@@ -107,9 +107,9 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
  * deletes and entire sub collection
  * @param {FirebaseFirestore.CollectionReference} collectionRef The collection reference
  */
-async function deleteSubCollection(collectionRef: FirebaseFirestore.CollectionReference): Promise<void> {
+async function deleteSubCollection(collectionRef: admin.firestore.CollectionReference): Promise<void> {
     const snapshot = await collectionRef.get();
-    await Promise.all(snapshot.docs.map(async (doc) => {
+    await Promise.all(snapshot.docs.map(async (doc: admin.firestore.QueryDocumentSnapshot) => {
         await doc.ref.delete();
         console.log(`Deleted document ${doc.id} from sub-collection.`);
     }));
@@ -372,6 +372,121 @@ export const onTrackCreated = onDocumentCreated('users/{userId}/tracks/{trackId}
     return Promise.resolve();
 });
 
+export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{trackId}', async (event) => {
+    const userId = event.params.userId;
+    const trackId = event.params.trackId;
+    const deletedData = event.data?.data();
+
+    console.log(`[User: ${userId}] LiveTrack document with ID ${trackId} was deleted`);
+    console.log(`[User: ${userId}] Deleted data:`, deletedData);
+
+    try {
+        // Get all locations before deletion
+        const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
+        const locationsSnapshot = await locationsRef.get();
+        if (!locationsSnapshot.empty) {
+            let totalSpeed = 0;
+            let maxSpeed = 0;
+            let startTime: Timestamp | null = null;
+            let endTime: Timestamp | null = null;
+            let locationCount = 0;
+
+            // Iterate through all locations
+            locationsSnapshot.forEach((doc) => {
+                const locationData = doc.data();
+                const speed = locationData.speed || 0;
+                const timestamp = locationData.timestamp as Timestamp;
+
+                if (!(timestamp instanceof Timestamp)) {
+                    console.error(`[User: ${userId}] Invalid timestamp format in location document`);
+                    return;
+                }
+
+                // Update metrics
+                totalSpeed += speed;
+                maxSpeed = Math.max(maxSpeed, speed);
+                locationCount++;
+
+                // Update start and end times
+                const timestampMillis = timestamp.toMillis();
+                if (!startTime || timestampMillis < startTime.toMillis()) {
+                    startTime = timestamp;
+                }
+                if (!endTime || timestampMillis > endTime.toMillis()) {
+                    endTime = timestamp;
+                }
+            });
+
+            // Calculate final metrics
+            const avgSpeed = locationCount > 0 ? totalSpeed / locationCount : 0;
+            const duration = startTime && endTime ?
+                ((endTime as Timestamp).toMillis() - (startTime as Timestamp).toMillis()) / 1000 : 0; // Duration in seconds
+
+            // Log the calculated metrics
+            console.log(`[User: ${userId}] Track Metrics for ${trackId}:`, {
+                averageSpeed: avgSpeed.toFixed(2),
+                maxSpeed: maxSpeed.toFixed(2),
+                duration: duration.toFixed(2),
+                locationCount,
+            });
+
+            // You could store these metrics somewhere if needed
+            // For example, in a separate collection or update the parent document
+        }
+
+        // Now delete the locations collection
+        await deleteSubCollection(locationsRef);
+        console.log(`[User: ${userId}] All documents in 'locations' sub-collection under LiveTrack ${trackId} deleted.`);
+    } catch (error) {
+        console.error(`[User: ${userId}] Error during LiveTrack deletion operation for trackId: ${trackId}`, error);
+    }
+
+    return Promise.resolve();
+});
+
+export const onLiveTrackCreated = onDocumentCreated('users/{userId}/liveTracks/{trackId}', async (event) => {
+    const userId = event.params.userId;
+    const trackId = event.params.trackId;
+    const createdData = event.data?.data();
+
+    console.log(`[User: ${userId}] LiveTrack document with ID ${trackId} was created`);
+    console.log(`[User: ${userId}] Created data:`, createdData);
+
+    try {
+        // Delete all documents in the Locations subcollection
+        const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
+        await deleteSubCollection(locationsRef);
+        // You can add any initialization logic here for new LiveTrack documents
+        console.log(`[User: ${userId}] Successfully processed new LiveTrack creation for trackId: ${trackId}`);
+    } catch (error) {
+        console.error(`[User: ${userId}] Error during LiveTrack creation operation for trackId: ${trackId}`, error);
+    }
+
+    return Promise.resolve();
+});
+
+export const onLiveTrackUpdated = onDocumentUpdated('users/{userId}/liveTracks/{trackId}', async (event) => {
+    const userId = event.params.userId;
+    const trackId = event.params.trackId;
+    const beforeData = event.data?.before.data();
+    const afterData = event.data?.after.data();
+
+    console.log(`[User: ${userId}] LiveTrack document with ID ${trackId} was updated`);
+    console.log(`[User: ${userId}] Before data:`, beforeData);
+    console.log(`[User: ${userId}] After data:`, afterData);
+
+    try {
+        // Delete all documents in the Locations subcollection
+        const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
+        await deleteSubCollection(locationsRef);
+        // You can add any initialization logic here for new LiveTrack documents
+        console.log(`[User: ${userId}] Successfully processed new LiveTrack creation for trackId: ${trackId}`);
+    } catch (error) {
+        console.error(`[User: ${userId}] Error during LiveTrack creation operation for trackId: ${trackId}`, error);
+    }
+
+    return Promise.resolve();
+});
 
 // export const eventhandler = onCustomEventPublished("firebase.extensions.storage-resize-images.v1.onSuccess", async (event) => {
 //     // Handle extension event here.
