@@ -2,7 +2,7 @@
 // import * as functions from 'firebase-functions';
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
-import {onDocumentCreated, onDocumentDeleted, onDocumentUpdated} from 'firebase-functions/v2/firestore';
+import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
 // import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
 // import {getStorage} from 'firebase-admin/storage';
@@ -115,6 +115,25 @@ async function deleteSubCollection(collectionRef: admin.firestore.CollectionRefe
     }));
 
     Promise.resolve();
+}
+
+/**
+ * Calculates the distance between two points on Earth using the Haversine formula
+ * @param {number} lat1 Latitude of the first point in degrees
+ * @param {number} lon1 Longitude of the first point in degrees
+ * @param {number} lat2 Latitude of the second point in degrees
+ * @param {number} lon2 Longitude of the second point in degrees
+ * @return {number} Distance between the points in kilometers
+ */
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // Earth's radius in kilometers
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c; // Distance in kilometers
 }
 
 export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (event) => {
@@ -390,17 +409,33 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
             let startTime: Timestamp | null = null;
             let endTime: Timestamp | null = null;
             let locationCount = 0;
+            let totalDistance = 0;
+            let prevLat: number | null = null;
+            let prevLon: number | null = null;
+            const breadcrumbs: any[] = [];
 
-            // Iterate through all locations
-            locationsSnapshot.forEach((doc) => {
+            // Create new track document with auto-generated ID
+            const newTrackRef = db.collection(`users/${userId}/tracks`).doc();
+
+            // Process all locations in order
+            await Promise.all(locationsSnapshot.docs.map(async (doc) => {
                 const locationData = doc.data();
                 const speed = locationData.speed || 0;
                 const timestamp = locationData.timestamp as Timestamp;
+                const latitude = locationData.latitude;
+                const longitude = locationData.longitude;
 
                 if (!(timestamp instanceof Timestamp)) {
                     console.error(`[User: ${userId}] Invalid timestamp format in location document`);
                     return;
                 }
+
+                // Calculate distance if we have previous coordinates
+                if (prevLat !== null && prevLon !== null && latitude && longitude) {
+                    totalDistance += calculateDistance(prevLat, prevLon, latitude, longitude);
+                }
+                prevLat = latitude;
+                prevLon = longitude;
 
                 // Update metrics
                 totalSpeed += speed;
@@ -415,18 +450,41 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                 if (!endTime || timestampMillis > endTime.toMillis()) {
                     endTime = timestamp;
                 }
-            });
+
+                // Add location data to breadcrumbs array
+                breadcrumbs.push({
+                    ...locationData,
+                });
+            }));
 
             // Calculate final metrics
             const avgSpeed = locationCount > 0 ? totalSpeed / locationCount : 0;
             const duration = startTime && endTime ?
-                ((endTime as Timestamp).toMillis() - (startTime as Timestamp).toMillis()) / 1000 : 0; // Duration in seconds
+                Math.floor(((endTime as Timestamp).toMillis() - (startTime as Timestamp).toMillis()) / 1000) : 0; // Duration in seconds as integer
+
+            // Create track document with summary data
+            await newTrackRef.set({
+                id: newTrackRef.id,
+                startTime,
+                endTime,
+                avgSpeed: avgSpeed,
+                maxSpeed: maxSpeed,
+                distance: totalDistance,
+                duration: duration,
+                locationCount,
+                dateCreated: Timestamp.now(),
+                breadcrumbs,
+                name: deletedData?.name,
+                startAddress: deletedData?.startAddress,
+                endAddress: deletedData?.endAddress,
+            });
 
             // Log the calculated metrics
-            console.log(`[User: ${userId}] Track Metrics for ${trackId}:`, {
+            console.log(`[User: ${userId}] Track Metrics for ${newTrackRef.id}:`, {
                 averageSpeed: avgSpeed.toFixed(2),
                 maxSpeed: maxSpeed.toFixed(2),
                 duration: duration.toFixed(2),
+                totalDistance: totalDistance.toFixed(2),
                 locationCount,
             });
 
@@ -465,28 +523,28 @@ export const onLiveTrackCreated = onDocumentCreated('users/{userId}/liveTracks/{
     return Promise.resolve();
 });
 
-export const onLiveTrackUpdated = onDocumentUpdated('users/{userId}/liveTracks/{trackId}', async (event) => {
-    const userId = event.params.userId;
-    const trackId = event.params.trackId;
-    const beforeData = event.data?.before.data();
-    const afterData = event.data?.after.data();
+// export const onLiveTrackUpdated = onDocumentUpdated('users/{userId}/liveTracks/{trackId}', async (event) => {
+//     const userId = event.params.userId;
+//     const trackId = event.params.trackId;
+//     const beforeData = event.data?.before.data();
+//     const afterData = event.data?.after.data();
 
-    console.log(`[User: ${userId}] LiveTrack document with ID ${trackId} was updated`);
-    console.log(`[User: ${userId}] Before data:`, beforeData);
-    console.log(`[User: ${userId}] After data:`, afterData);
+//     console.log(`[User: ${userId}] LiveTrack document with ID ${trackId} was updated`);
+//     console.log(`[User: ${userId}] Before data:`, beforeData);
+//     console.log(`[User: ${userId}] After data:`, afterData);
 
-    try {
-        // Delete all documents in the Locations subcollection
-        const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
-        await deleteSubCollection(locationsRef);
-        // You can add any initialization logic here for new LiveTrack documents
-        console.log(`[User: ${userId}] Successfully processed new LiveTrack creation for trackId: ${trackId}`);
-    } catch (error) {
-        console.error(`[User: ${userId}] Error during LiveTrack creation operation for trackId: ${trackId}`, error);
-    }
+//     try {
+//         // Delete all documents in the Locations subcollection
+//         const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
+//         await deleteSubCollection(locationsRef);
+//         // You can add any initialization logic here for new LiveTrack documents
+//         console.log(`[User: ${userId}] Successfully processed new LiveTrack creation for trackId: ${trackId}`);
+//     } catch (error) {
+//         console.error(`[User: ${userId}] Error during LiveTrack creation operation for trackId: ${trackId}`, error);
+//     }
 
-    return Promise.resolve();
-});
+//     return Promise.resolve();
+// });
 
 // export const eventhandler = onCustomEventPublished("firebase.extensions.storage-resize-images.v1.onSuccess", async (event) => {
 //     // Handle extension event here.
