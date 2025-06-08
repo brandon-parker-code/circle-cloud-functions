@@ -3,6 +3,7 @@
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
 import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
+import {onSchedule} from 'firebase-functions/v2/scheduler';
 // import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
 // import {getStorage} from 'firebase-admin/storage';
@@ -100,6 +101,37 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
         return await admin.messaging().send(message);
     }
 
+    return null;
+}
+
+/**
+ * Sends a Silent Push Notification to the device
+ * @param {string} deviceToken The users deviceToken
+ * @param {string} content data content
+ * @return {Promise<string> | null} The deviceToken or null
+ */
+async function sendSilentPushNotification(deviceToken: string, content: string): Promise<string | null> {
+    if (deviceToken) {
+        const message = {
+            token: deviceToken,
+            apns: {
+                headers: {
+                    'apns-push-type': 'background',
+                    'apns-topic': 'bp.circles',
+                    'apns-priority': '5', // Background priority
+                    'content-type': 'application/json',
+                },
+                payload: {
+                    aps: {
+                        'content-available': 1, // Required for silent push
+                    },
+                },
+            },
+        };
+
+        console.log(JSON.stringify(message, null, 2));
+        return await admin.messaging().send(message);
+    }
     return null;
 }
 
@@ -414,9 +446,6 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
             let prevLon: number | null = null;
             const breadcrumbs: any[] = [];
 
-            // Create new track document with auto-generated ID
-            const newTrackRef = db.collection(`users/${userId}/tracks`).doc();
-
             // Process all locations in order
             await Promise.all(locationsSnapshot.docs.map(async (doc) => {
                 const locationData = doc.data();
@@ -462,34 +491,44 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
             const duration = startTime && endTime ?
                 Math.floor(((endTime as Timestamp).toMillis() - (startTime as Timestamp).toMillis()) / 1000) : 0; // Duration in seconds as integer
 
-            // Create track document with summary data
-            await newTrackRef.set({
-                id: newTrackRef.id,
-                startTime,
-                endTime,
-                avgSpeed: avgSpeed,
-                maxSpeed: maxSpeed,
-                distance: totalDistance,
-                duration: duration,
-                locationCount,
-                dateCreated: Timestamp.now(),
-                breadcrumbs,
-                name: deletedData?.name,
-                startAddress: deletedData?.startAddress,
-                endAddress: deletedData?.endAddress,
-            });
+            // Validate track data before creating new track
+            if (locationCount < 5 || totalDistance === 0 || avgSpeed === 0) {
+                console.log(`[User: ${userId}] Track validation failed - Not creating new track. Metrics:`, {
+                    locationCount,
+                    totalDistance: totalDistance.toFixed(2),
+                    avgSpeed: avgSpeed.toFixed(2),
+                });
+            } else {
+                // Create new track document with auto-generated ID
+                const newTrackRef = db.collection(`users/${userId}/tracks`).doc();
 
-            // Log the calculated metrics
-            console.log(`[User: ${userId}] Track Metrics for ${newTrackRef.id}:`, {
-                averageSpeed: avgSpeed.toFixed(2),
-                maxSpeed: maxSpeed.toFixed(2),
-                duration: duration.toFixed(2),
-                totalDistance: totalDistance.toFixed(2),
-                locationCount,
-            });
+                // Create track document with summary data
+                await newTrackRef.set({
+                    id: newTrackRef.id,
+                    startTime,
+                    endTime,
+                    avgSpeed: avgSpeed,
+                    maxSpeed: maxSpeed,
+                    distance: totalDistance,
+                    duration: duration,
+                    locationCount,
+                    dateCreated: Timestamp.now(),
+                    breadcrumbs,
+                    name: deletedData?.name,
+                    startAddress: deletedData?.startAddress,
+                    endAddress: deletedData?.endAddress,
+                    screenAccessCount: deletedData?.screenAccessCount,
+                });
 
-            // You could store these metrics somewhere if needed
-            // For example, in a separate collection or update the parent document
+                // Log the calculated metrics
+                console.log(`[User: ${userId}] Track Metrics for ${newTrackRef.id}:`, {
+                    averageSpeed: avgSpeed.toFixed(2),
+                    maxSpeed: maxSpeed.toFixed(2),
+                    duration: duration.toFixed(2),
+                    totalDistance: totalDistance.toFixed(2),
+                    locationCount,
+                });
+            }
         }
 
         // Now delete the locations collection
@@ -569,3 +608,63 @@ export const onLiveTrackCreated = onDocumentCreated('users/{userId}/liveTracks/{
 //     // Additional operations based on the event data can be performed here
 //     return Promise.resolve();
 // });
+
+export const scheduledFunction = onSchedule({
+    schedule: 'every 15 minutes',
+    timeZone: 'UTC',
+}, async (event) => {
+    console.log('Scheduled function triggered at:', new Date().toISOString());
+
+    try {
+        // Get all users from the users collection
+        const usersSnapshot = await db.collection('users').get();
+
+        if (usersSnapshot.empty) {
+            console.log('No users found in the database');
+            return;
+        }
+
+        console.log(`Found ${usersSnapshot.size} users to process`);
+
+        // Process each user and send a silent notification
+        const notificationPromises = usersSnapshot.docs.map(async (userDoc) => {
+            const userData = userDoc.data();
+            const userId = userData.userId;
+
+            if (!userId) {
+                console.log(`User document ${userDoc.id} has no userId field, skipping`);
+                return;
+            }
+
+            // Get the device token for this user
+            const deviceToken = await getDeviceToken(userId);
+
+            if (!deviceToken) {
+                console.log(`No device token found for user ${userId}, skipping notification`);
+                return;
+            }
+
+            // Create notification content
+            const content = JSON.stringify({
+                action: 'refresh',
+                timestamp: new Date().toISOString(),
+            });
+
+            // Send the silent notification
+            const result = await sendSilentPushNotification(deviceToken, content);
+
+            if (result) {
+                console.log(`Successfully sent silent notification to user ${userId}`);
+            } else {
+                console.log(`Failed to send silent notification to user ${userId}`);
+            }
+        });
+
+        // Wait for all notifications to be processed
+        await Promise.all(notificationPromises);
+
+        console.log('Scheduled task completed successfully');
+    } catch (error) {
+        console.error('Error in scheduled function:', error);
+    }
+});
