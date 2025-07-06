@@ -4,13 +4,19 @@ import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
 import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
 import {onSchedule} from 'firebase-functions/v2/scheduler';
+import {defineSecret} from 'firebase-functions/params';
 // import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
 // import {getStorage} from 'firebase-admin/storage';
+// import {HttpsError, onCall} from 'firebase-functions/v2/https';
+import {logger} from 'firebase-functions/v2';
 
 initializeApp();
 const db = getFirestore();
 db.settings({ignoreUndefinedProperties: true});
+
+// Define the Google API Key secret
+const googleApiKeySecret = defineSecret('GOOGLE_API_KEY');
 // Define the TypeScript interface for notifications
 interface LocationNotification {
     title: string;
@@ -117,14 +123,15 @@ async function sendSilentPushNotification(deviceToken: string, content: string):
             apns: {
                 headers: {
                     'apns-push-type': 'background',
-                    'apns-topic': 'bp.circles',
-                    'apns-priority': '5', // Background priority
-                    'content-type': 'application/json',
+                    'apns-priority': '5',
+                    // No apns-topic needed - Firebase auto-detects!
                 },
                 payload: {
                     aps: {
-                        'content-available': 1, // Required for silent push
+                        'content-available': 1,
                     },
+                    shouldTrack: true,
+                    timestamp: Date.now(),
                 },
             },
         };
@@ -155,10 +162,10 @@ async function deleteSubCollection(collectionRef: admin.firestore.CollectionRefe
  * @param {number} lon1 Longitude of the first point in degrees
  * @param {number} lat2 Latitude of the second point in degrees
  * @param {number} lon2 Longitude of the second point in degrees
- * @return {number} Distance between the points in meters
+ * @return {number} Distance between the points in meters (consistent with existing GPS data)
  */
-function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-    const R = 6371000; // Earth's radius in meters (changed from 6371 km)
+function calculateDistanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371000; // Earth's radius in meters
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
     const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
@@ -166,6 +173,88 @@ function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: numbe
         Math.sin(dLon/2) * Math.sin(dLon/2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     return R * c; // Distance in meters
+}
+
+/**
+ * Calculates the course (bearing) between two points
+ * @param {number} lat1 Latitude of the first point in degrees
+ * @param {number} lon1 Longitude of the first point in degrees
+ * @param {number} lat2 Latitude of the second point in degrees
+ * @param {number} lon2 Longitude of the second point in degrees
+ * @return {number} Course in degrees (0-360)
+ */
+function calculateCourse(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const lat1Rad = lat1 * Math.PI / 180;
+    const lat2Rad = lat2 * Math.PI / 180;
+
+    const y = Math.sin(dLon) * Math.cos(lat2Rad);
+    const x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
+
+    let bearing = Math.atan2(y, x) * 180 / Math.PI;
+    bearing = (bearing + 360) % 360; // Normalize to 0-360 degrees
+
+    return bearing;
+}
+
+/**
+ * Finds the closest original breadcrumb to a snapped point
+ * @param {number} snappedLat Latitude of the snapped point
+ * @param {number} snappedLon Longitude of the snapped point
+ * @param {any[]} originalBreadcrumbs Array of original breadcrumbs
+ * @return {any|null} The closest original breadcrumb or null
+ */
+function findClosestOriginalBreadcrumb(snappedLat: number, snappedLon: number, originalBreadcrumbs: any[]): any | null {
+    if (!originalBreadcrumbs || originalBreadcrumbs.length === 0) {
+        return null;
+    }
+
+    let closestBreadcrumb = null;
+    let minDistance = Infinity;
+
+    for (const breadcrumb of originalBreadcrumbs) {
+        if (breadcrumb.latitude && breadcrumb.longitude) {
+            const distance = calculateDistanceMeters(snappedLat, snappedLon, breadcrumb.latitude, breadcrumb.longitude);
+            if (distance < minDistance) {
+                minDistance = distance;
+                closestBreadcrumb = breadcrumb;
+            }
+        }
+    }
+
+    return closestBreadcrumb;
+}
+
+/**
+ * Interpolates timestamp for a snapped point based on its position relative to original breadcrumbs
+ * @param {number} snappedLat Latitude of the snapped point
+ * @param {number} snappedLon Longitude of the snapped point
+ * @param {any[]} originalBreadcrumbs Array of original breadcrumbs (sorted by timestamp)
+ * @param {number} snappedIndex Index of the snapped point in the snapped array
+ * @param {number} totalSnappedPoints Total number of snapped points
+ * @return {any|null} Interpolated timestamp or null
+ */
+function interpolateTimestamp(snappedLat: number, snappedLon: number, originalBreadcrumbs: any[], snappedIndex: number, totalSnappedPoints: number): any | null {
+    if (!originalBreadcrumbs || originalBreadcrumbs.length < 2) {
+        return null;
+    }
+
+    // Find the two closest original breadcrumbs that surround this snapped point
+    const firstBreadcrumb = originalBreadcrumbs[0];
+    const lastBreadcrumb = originalBreadcrumbs[originalBreadcrumbs.length - 1];
+
+    if (!firstBreadcrumb.timestamp || !lastBreadcrumb.timestamp) {
+        return null;
+    }
+
+    // Simple linear interpolation based on the snapped point's position in the sequence
+    const progress = snappedIndex / (totalSnappedPoints - 1);
+    const startTime = firstBreadcrumb.timestamp.toMillis();
+    const endTime = lastBreadcrumb.timestamp.toMillis();
+    const interpolatedTime = startTime + (endTime - startTime) * progress;
+
+    // Convert back to Firestore Timestamp
+    return admin.firestore.Timestamp.fromMillis(interpolatedTime);
 }
 
 export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (event) => {
@@ -206,11 +295,15 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         // //     }));
         // }));
 
-        // Get the user document where the userId matches
-        const deviceToken = await getDeviceToken(userId);
-        // Send a notification to the user
-        if (deviceToken) {
-            await sendPushNotification(deviceToken, 'Circle Deleted', `Circle ${circleName} has been deleted.`);
+        // Get the user document where the userId matches (only if userId exists)
+        if (userId) {
+            const deviceToken = await getDeviceToken(userId);
+            // Send a notification to the user
+            if (deviceToken) {
+                await sendPushNotification(deviceToken, 'Circle Deleted', `Circle ${circleName || 'Unknown'} has been deleted.`);
+            }
+        } else {
+            console.log('No userId found in deleted circle data, skipping notification');
         }
 
         // Optional: Handle other tasks that may need to be done asynchronously
@@ -382,45 +475,280 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
     return Promise.resolve();
 });
 
-export const onTrackCreated = onDocumentCreated('users/{userId}/tracks/{trackId}', async (event) => {
-    const snapshot = event.data;
-    if (!snapshot) {
-        console.log('No data associated with the event.');
+/**
+ * Creates a track notification for the user
+ * @param {string} userId The user ID
+ * @param {string} trackId The track ID
+ * @param {any} trackData The track data
+ */
+async function createTrackNotification(userId: string, trackId: string, trackData: any): Promise<void> {
+    try {
+        logger.info(`${userId}: Creating track notification for track ${trackId}`);
+
+        // Create a new document reference to get the ID before writing
+        const notificationRef = db.collection(`users/${userId}/notifications`).doc();
+
+        // Create a track notification object with strong typing
+        const trackNotification: TrackNotification = {
+            startTime: trackData.startTime,
+            endTime: trackData.endTime,
+            avgSpeed: trackData.avgSpeed,
+            maxSpeed: trackData.maxSpeed,
+            distance: trackData.distance,
+            duration: trackData.duration,
+        };
+
+        // Create the notification object with strong typing
+        const notificationData: Notification = {
+            id: notificationRef.id, // Store the generated ID
+            userId: userId, // userId for the user that generated the event
+            circleId: 'circleId', // The circleId
+            userName: trackData.name || 'Unknown User', // userName for the user that generated the event
+            trackNotification: trackNotification,
+            locationNotification: undefined, // set undefined for track notifications
+            dateCreated: Timestamp.now(), // Firestore timestamp
+        };
+
+        // Insert into user's 'notifications' subcollection
+        await notificationRef.set(notificationData);
+        logger.info(`${userId}: Successfully created track notification for track ${trackId}`);
+    } catch (error) {
+        logger.error(`${userId}: Error creating track notification for track ${trackId}: ${error}`);
+        // Don't throw - notification creation failure shouldn't stop other processing
+    }
+}
+
+/**
+ * Processes a track through Google Roads API for road snapping
+ * @param {string} userId The user ID
+ * @param {string} trackId The track ID
+ * @param {any} trackData The track data
+ * @param {admin.firestore.DocumentReference} trackRef The track document reference
+ */
+async function processTrackWithGoogleRoads(userId: string, trackId: string, trackData: any, trackRef: admin.firestore.DocumentReference): Promise<void> {
+    try {
+        logger.info(`${userId}: Starting Google Roads API processing for track ${trackId}`);
+
+        // Validate breadcrumbs exist and meet minimum requirements for Roads processing
+        if (!trackData.breadcrumbs || !Array.isArray(trackData.breadcrumbs) || trackData.breadcrumbs.length < 2) {
+            logger.info(`${userId}: Track ${trackId} has insufficient breadcrumbs (${trackData.breadcrumbs?.length || 0}), skipping Roads processing`);
+            return;
+        }
+
+        // Check if already processed to avoid reprocessing
+        if (trackData.snappedToRoads === true) {
+            logger.info(`${userId}: Track ${trackId} already processed with Google Roads, skipping Roads processing`);
+            return;
+        }
+
+        logger.info(`${userId}: Processing ${trackData.breadcrumbs.length} breadcrumbs for track ${trackId} with Google Roads API`);
+
+        // Sort breadcrumbs by timestamp (Firestore Timestamp objects) to ensure chronological order
+        const breadcrumbs = [...trackData.breadcrumbs].sort((a, b) => {
+            // Handle missing timestamps
+            if (!a.timestamp && !b.timestamp) return 0;
+            if (!a.timestamp) return 1;
+            if (!b.timestamp) return -1;
+
+            // For Firestore Timestamps, use toMillis() method
+            const aTime = a.timestamp.toMillis();
+            const bTime = b.timestamp.toMillis();
+
+            return aTime - bTime;
+        });
+
+        logger.info(`${userId}: Sorted ${breadcrumbs.length} breadcrumbs chronologically for track ${trackId}`);
+
+        // Get Google API key from Firebase secrets (Firebase v2)
+        const googleApiKey = googleApiKeySecret.value();
+        if (!googleApiKey) {
+            logger.error(`${userId}: Google API key not configured in Firebase secrets, skipping Roads processing for track ${trackId}`);
+            return;
+        }
+
+        // Google Roads API has a limit of 100 points per request, so we may need to batch
+        const maxPointsPerRequest = 100;
+        const batches = [];
+
+        for (let i = 0; i < breadcrumbs.length; i += maxPointsPerRequest) {
+            batches.push(breadcrumbs.slice(i, i + maxPointsPerRequest));
+        }
+
+        logger.info(`${userId}: Processing ${batches.length} batches for track ${trackId}`);
+
+        let allSnappedPoints: any[] = [];
+
+        // Process each batch
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+            const batch = batches[batchIndex];
+
+            // Prepare path string for Google Roads API (lat,lng|lat,lng|...)
+            const pathString = batch.map((breadcrumb: any) =>
+                `${breadcrumb.latitude},${breadcrumb.longitude}`
+            ).join('|');
+
+            const url = `https://roads.googleapis.com/v1/snapToRoads?path=${encodeURIComponent(pathString)}&interpolate=true&key=${googleApiKey}`;
+
+            logger.info(`${userId}: Calling Google Roads API for batch ${batchIndex + 1}/${batches.length} of track ${trackId}`);
+
+            // Call Google Roads API
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                logger.error(`${userId}: Google Roads API error for track ${trackId}, batch ${batchIndex + 1}: ${response.status} - ${errorText}`);
+
+                // Mark as failed but don't throw to avoid retries
+                await trackRef.update({
+                    roadsProcessingFailed: true,
+                    roadsProcessingError: `API error batch ${batchIndex + 1}: ${response.status}`,
+                    roadsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                return;
+            }
+
+            const roadsResult = await response.json();
+
+            // Validate response structure
+            if (!roadsResult.snappedPoints || !Array.isArray(roadsResult.snappedPoints)) {
+                logger.error(`${userId}: Invalid Google Roads API response for track ${trackId}, batch ${batchIndex + 1}`);
+
+                await trackRef.update({
+                    roadsProcessingFailed: true,
+                    roadsProcessingError: `Invalid API response structure batch ${batchIndex + 1}`,
+                    roadsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                return;
+            }
+
+            logger.info(`${userId}: Successfully snapped ${roadsResult.snappedPoints.length} points for batch ${batchIndex + 1} of track ${trackId}`);
+            allSnappedPoints = allSnappedPoints.concat(roadsResult.snappedPoints);
+        }
+
+        logger.info(`${userId}: Successfully processed all batches with ${allSnappedPoints.length} total snapped points for track ${trackId}`);
+
+        // Convert snapped points back to breadcrumb format with inferred data from original breadcrumbs
+        const snappedBreadcrumbs = allSnappedPoints.map((snappedPoint: any, index: number) => {
+            // Find the closest original breadcrumb to infer missing data
+            const originalBreadcrumb = findClosestOriginalBreadcrumb(
+                snappedPoint.location.latitude,
+                snappedPoint.location.longitude,
+                breadcrumbs
+            );
+
+            // Calculate speed and course if we have enough context
+            const inferredSpeed = originalBreadcrumb?.speed || null;
+            let inferredCourse = originalBreadcrumb?.course || null;
+            let inferredTimestamp = originalBreadcrumb?.timestamp || null;
+
+            // If we have previous snapped point, calculate course between them
+            if (index > 0) {
+                const prevSnapped = allSnappedPoints[index - 1];
+                inferredCourse = calculateCourse(
+                    prevSnapped.location.latitude,
+                    prevSnapped.location.longitude,
+                    snappedPoint.location.latitude,
+                    snappedPoint.location.longitude
+                );
+            }
+
+            // Interpolate timestamp if we have surrounding original points
+            if (index > 0 && index < allSnappedPoints.length - 1) {
+                inferredTimestamp = interpolateTimestamp(
+                    snappedPoint.location.latitude,
+                    snappedPoint.location.longitude,
+                    breadcrumbs,
+                    index,
+                    allSnappedPoints.length
+                );
+            }
+
+            return {
+                latitude: snappedPoint.location.latitude,
+                longitude: snappedPoint.location.longitude,
+                // Inferred data from original breadcrumbs
+                timestamp: inferredTimestamp,
+                accuracy: null, // Road snapping replaces GPS accuracy
+                altitude: originalBreadcrumb?.altitude || null, // Keep original altitude if available
+                speed: inferredSpeed,
+                course: inferredCourse,
+                // Add snapping metadata
+                wasSnapped: true,
+                snappedIndex: index, // Index in the snapped array
+                placeId: snappedPoint.placeId || null, // Google's place ID for the road
+                originalBreadcrumbIndex: originalBreadcrumb ? breadcrumbs.indexOf(originalBreadcrumb) : null,
+            };
+        });
+
+        // Calculate distance using the snapped coordinates (in meters for consistency with GPS data)
+        let totalDistanceMeters = 0;
+        for (let i = 1; i < snappedBreadcrumbs.length; i++) {
+            const prev = snappedBreadcrumbs[i - 1];
+            const curr = snappedBreadcrumbs[i];
+            totalDistanceMeters += calculateDistanceMeters(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+        }
+
+        // Update the track document with snapped data
+        const updateData: any = {
+            breadcrumbs: trackData.breadcrumbs, // Keep original for reference
+            enhancedBreadcrumbs: snappedBreadcrumbs,
+            snappedToRoads: true,
+            distance: totalDistanceMeters, // Use calculated distance from snapped points (in meters)
+            roadsProcessingFailed: false,
+            roadsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+        await trackRef.update(updateData);
+
+        logger.info(`${userId}: Successfully updated track ${trackId} with ${snappedBreadcrumbs.length} snapped breadcrumbs`);
+        logger.info(`${userId}: Updated distance from ${trackData.distance.toFixed(2)} meters to ${totalDistanceMeters.toFixed(2)} meters for track ${trackId}`);
+    } catch (error) {
+        logger.error(`${userId}: Error processing track ${trackId} with Google Roads API: ${error}`);
+
+        // Mark as failed but don't throw to avoid infinite retries
+        try {
+            await trackRef.update({
+                roadsProcessingFailed: true,
+                roadsProcessingError: error instanceof Error ? error.message : 'Unknown error',
+                roadsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+        } catch (updateError) {
+            logger.error(`${userId}: Failed to update error status for track ${trackId}: ${updateError}`);
+        }
+    }
+}
+
+/**
+ * Cloud Function triggered when a track is created
+ * Creates a track notification AND automatically processes the track through Google Roads API
+ */
+export const onTrackCreated = onDocumentCreated({
+    document: 'users/{userId}/tracks/{trackId}',
+    secrets: [googleApiKeySecret],
+}, async (event) => {
+    const userId = event.params.userId;
+    const trackId = event.params.trackId;
+    const trackData = event.data?.data();
+
+    if (!trackData) {
+        logger.error(`${userId}: No track data found for track ${trackId}`);
         return;
     }
-    const eventData = snapshot.data();
-    const userId = event.params.userId;
 
-    // Create a new document reference to get the ID before writing
-    const notificationRef = db.collection(`users/${userId}/notifications`).doc();
+    logger.info(`${userId}: Processing new track ${trackId} - creating notification and processing with Google Roads API`);
 
-    // Create a track notification object with strong typing
-    const trackNotification: TrackNotification = {
-        startTime: eventData.startTime,
-        endTime: eventData.endTime,
-        avgSpeed: eventData.avgSpeed,
-        maxSpeed: eventData.maxSpeed,
-        distance: eventData.distance,
-        duration: eventData.duration,
-    };
+    // Execute both operations in parallel for better performance
+    await Promise.allSettled([
+        createTrackNotification(userId, trackId, trackData),
+        processTrackWithGoogleRoads(userId, trackId, trackData, event.data!.ref),
+    ]);
 
-    // Create the notification object with strong typing
-    const notificationData: Notification = {
-        id: notificationRef.id, // Store the generated ID
-        userId: userId, // userId for the user that generated the event
-        circleId: 'circleId', // The circleId
-        userName: eventData.name, // userName for the ser that generated th even
-        trackNotification: trackNotification, // set undefined
-        locationNotification: undefined, // Message Title
-        dateCreated: Timestamp.now(), // Firestore timestamp
-    };
-
-    // Insert into user's 'notifications' subcollection
-    notificationRef.set(notificationData);
-
-
-    console.log(`Processing Notification Track data for user ${userId}`);
-    return Promise.resolve();
+    logger.info(`${userId}: Completed processing for track ${trackId}`);
 });
 
 export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{trackId}', async (event) => {
@@ -441,9 +769,9 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
             let startTime: Timestamp | null = null;
             let endTime: Timestamp | null = null;
             let locationCount = 0;
-            let totalDistance = 0;
-            let prevLat: number | null = null;
-            let prevLon: number | null = null;
+            // let totalDistance = 0;
+            // let prevLat: number | null = null;
+            // let prevLon: number | null = null;
             const breadcrumbs: any[] = [];
 
             // Process all locations in order
@@ -451,8 +779,8 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                 const locationData = doc.data();
                 const speed = locationData.speed || 0;
                 const timestamp = locationData.timestamp as Timestamp;
-                const latitude = locationData.latitude;
-                const longitude = locationData.longitude;
+                // const latitude = locationData.latitude;
+                // const longitude = locationData.longitude;
 
                 if (!(timestamp instanceof Timestamp)) {
                     console.error(`[User: ${userId}] Invalid timestamp format in location document`);
@@ -460,15 +788,20 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                 }
 
                 // Calculate distance if we have previous coordinates
-                if (prevLat !== null && prevLon !== null && latitude && longitude) {
-                    totalDistance += calculateDistance(prevLat, prevLon, latitude, longitude);
-                }
-                prevLat = latitude;
-                prevLon = longitude;
+                // if (prevLat !== null && prevLon !== null && latitude && longitude) {
+                //     const segmentDistance = calculateDistance(prevLat, prevLon, latitude, longitude);
+                //     // Only add distance if it's above a minimum threshold (10 meters) to filter GPS noise
+                //     if (segmentDistance >= 0.01) { // 0.01 km = 10 meters
+                //         totalDistance += segmentDistance;
+                //     }
+                // }
+                // prevLat = latitude;
+                // prevLon = longitude;
 
-                // Update metrics
-                totalSpeed += speed;
-                maxSpeed = Math.max(maxSpeed, speed);
+                // Update metrics - ensure speed is a valid number
+                const validSpeed = (typeof speed === 'number' && !isNaN(speed)) ? speed : 0;
+                totalSpeed += validSpeed;
+                maxSpeed = Math.max(maxSpeed, validSpeed);
                 locationCount++;
 
                 // Update start and end times
@@ -486,17 +819,18 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                 });
             }));
 
-            // Calculate final metrics
-            const avgSpeed = locationCount > 0 ? totalSpeed / locationCount : 0;
+            // Calculate final metrics - ensure avgSpeed is always a valid number
+            let avgSpeed = locationCount > 0 ? totalSpeed / locationCount : 0;
+            avgSpeed = (typeof avgSpeed === 'number' && !isNaN(avgSpeed)) ? avgSpeed : 0;
             const duration = startTime && endTime ?
                 Math.floor(((endTime as Timestamp).toMillis() - (startTime as Timestamp).toMillis()) / 1000) : 0; // Duration in seconds as integer
 
             // Validate track data before creating new track
-            if (locationCount < 5 || totalDistance === 0 || avgSpeed === 0) {
+            if (locationCount < 5 || deletedData?.distance === 0 || avgSpeed === 0) {
                 console.log(`[User: ${userId}] Track validation failed - Not creating new track. Metrics:`, {
                     locationCount,
-                    totalDistance: totalDistance.toFixed(2),
-                    avgSpeed: avgSpeed.toFixed(2),
+                    totalDistance: deletedData?.distance,
+                    avgSpeed: avgSpeed,
                 });
             } else {
                 // Create new track document with auto-generated ID
@@ -509,7 +843,7 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     endTime,
                     avgSpeed: avgSpeed,
                     maxSpeed: maxSpeed,
-                    distance: totalDistance,
+                    distance: deletedData?.distance,
                     duration: duration,
                     locationCount,
                     dateCreated: Timestamp.now(),
@@ -520,12 +854,58 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     screenAccessCount: deletedData?.screenAccessCount,
                 });
 
+                // Get user's circles and notify circle members
+                const userDoc = await db.collection('users').where('userId', '==', userId).get();
+                if (!userDoc.empty) {
+                    const userData = userDoc.docs[0].data();
+                    const circleIds = userData.circleIds || [];
+                    const userName = userData.name || 'Someone';
+
+                    // Process each circle the user is a member of
+                    const circlePromises = circleIds.map(async (circleId: string) => {
+                        try {
+                            const circleDoc = await db.collection('circles').doc(circleId).get();
+                            if (circleDoc.exists) {
+                                const circleData = circleDoc.data();
+                                const circleUsers = circleData?.users || [];
+
+                                // Notify each user in the circle (except the track creator)
+                                const notificationPromises = circleUsers
+                                    // .filter((user: any) => user.id !== userId) // Don't notify the track creator
+                                    .map(async (user: any) => {
+                                        try {
+                                            // Get device token for circle member
+                                            const deviceToken = await getDeviceToken(user.id);
+
+                                            if (deviceToken) {
+                                                const title = 'New Track';
+                                                const body = `${userName} completed a track: ${deletedData?.name || 'Untitled Track'}`;
+
+                                                // Send push notification
+                                                await sendPushNotification(deviceToken, title, body);
+                                                console.log(`[User: ${userId}] Sent track notification to circle member ${user.id}`);
+                                            }
+                                        } catch (error) {
+                                            console.error(`[User: ${userId}] Error sending notification to circle member ${user.id}:`, error);
+                                        }
+                                    });
+
+                                await Promise.all(notificationPromises);
+                            }
+                        } catch (error) {
+                            console.error(`[User: ${userId}] Error processing circle ${circleId}:`, error);
+                        }
+                    });
+
+                    await Promise.all(circlePromises);
+                }
+
                 // Log the calculated metrics
                 console.log(`[User: ${userId}] Track Metrics for ${newTrackRef.id}:`, {
                     averageSpeed: avgSpeed.toFixed(2),
                     maxSpeed: maxSpeed.toFixed(2),
                     duration: duration.toFixed(2),
-                    totalDistance: totalDistance.toFixed(2),
+                    totalDistance: deletedData?.distance.toFixed(2),
                     locationCount,
                 });
             }
@@ -579,40 +959,12 @@ export const onLiveTrackCreated = onDocumentCreated('users/{userId}/liveTracks/{
 //         // You can add any initialization logic here for new LiveTrack documents
 //         console.log(`[User: ${userId}] Successfully processed new LiveTrack creation for trackId: ${trackId}`);
 //     } catch (error) {
-//         console.error(`[User: ${userId}] Error during LiveTrack creation operation for trackId: ${trackId}`, error);
-//     }
-
-//     return Promise.resolve();
-// });
-
-// export const eventhandler = onCustomEventPublished("firebase.extensions.storage-resize-images.v1.onSuccess", async (event) => {
-//     // Handle extension event here.
-
-//     functions.logger.info("Resize Image is successful", event);
-
-//     const fileBucket = event.data.input.bucket;
-//     const name = event.data.input.name;
-//     const compressName = event.data.outputs[0].outputFilePath;
-
-
-//     console.log(`bucket: ${fileBucket} name: ${name}  compressed: ${compressName}`);
-//     // const bucket = firebase.Storage().ref.bucket(fileBucket);
-//     const bucket = admin.storage().bucket(fileBucket);
-//     // rename the original file temporarily
-//     await bucket.file(name).rename(name + '.tmp');
-//     await bucket.file(compressName).rename(name);
-//     await bucket.file(name + '.tmp').delete();
-
-//     // var desertRef = storageRef.child('images/desert.jpg');
-
-//     // Additional operations based on the event data can be performed here
-//     return Promise.resolve();
-// });
+//         console.error(`
 
 export const scheduledFunction = onSchedule({
     schedule: 'every 15 minutes',
     timeZone: 'UTC',
-}, async (event) => {
+}, async () => {
     console.log('Scheduled function triggered at:', new Date().toISOString());
 
     try {
@@ -660,11 +1012,95 @@ export const scheduledFunction = onSchedule({
             }
         });
 
-        // Wait for all notifications to be processed
+        // Wait for all notifications to be sent
         await Promise.all(notificationPromises);
 
-        console.log('Scheduled task completed successfully');
+        console.log('Scheduled function completed successfully');
     } catch (error) {
         console.error('Error in scheduled function:', error);
+        throw error;
+    }
+});
+
+/**
+ * Scheduled function that runs every 20 minutes to check user activity
+ * Updates users to "stationary" status if they haven't been active for more than 20 minutes
+ */
+export const checkUserActivity = onSchedule({
+    schedule: 'every 20 minutes',
+    timeZone: 'UTC',
+}, async () => {
+    console.log('User activity check function triggered at:', new Date().toISOString());
+
+    try {
+        // Get all users from the users collection
+        const usersSnapshot = await db.collection('users').get();
+
+        if (usersSnapshot.empty) {
+            console.log('No users found in the database');
+            return;
+        }
+
+        console.log(`Found ${usersSnapshot.size} users to check for activity`);
+
+        // Calculate the threshold time (20 minutes ago)
+        const twentyMinutesAgo = new Date(Date.now() - 20 * 60 * 1000);
+        const twentyMinutesAgoTimestamp = Timestamp.fromDate(twentyMinutesAgo);
+
+        let updatedCount = 0;
+        let skippedCount = 0;
+
+        // Process each user to check their activity
+        const updatePromises = usersSnapshot.docs.map(async (userDoc) => {
+            const userData = userDoc.data();
+            const userId = userData.userId;
+            const lastActivity = userData.lastActivity;
+            const currentActivity = userData.activity;
+
+            if (!userId) {
+                console.log(`User document ${userDoc.id} has no userId field, skipping`);
+                skippedCount++;
+                return;
+            }
+
+            // Check if lastActivity field exists and is a valid Timestamp
+            if (!lastActivity || !(lastActivity instanceof Timestamp)) {
+                console.log(`User ${userId} has no valid lastActivity timestamp, skipping`);
+                skippedCount++;
+                return;
+            }
+
+            // Check if user has been inactive for more than 20 minutes
+            if (lastActivity.toMillis() < twentyMinutesAgoTimestamp.toMillis()) {
+                // Only update if the current activity is not already "stationary"
+                if (currentActivity !== 'stationary') {
+                    try {
+                        await userDoc.ref.update({
+                            activity: 'stationary',
+                            lastActivity: Timestamp.now(),
+                        });
+
+                        console.log(`Updated user ${userId} to stationary status (last activity: ${lastActivity.toDate().toISOString()})`);
+                        updatedCount++;
+                    } catch (error) {
+                        console.error(`Error updating user ${userId} activity status:`, error);
+                    }
+                } else {
+                    console.log(`User ${userId} is already stationary, skipping update`);
+                    skippedCount++;
+                }
+            } else {
+                console.log(`User ${userId} is still active (last activity: ${lastActivity.toDate().toISOString()})`);
+                skippedCount++;
+            }
+        });
+
+        // Wait for all updates to complete
+        await Promise.all(updatePromises);
+
+        console.log(`User activity check completed: ${updatedCount} users updated to stationary, ${skippedCount} users skipped`);
+    } catch (error) {
+        console.error('Error in user activity check function:', error);
+        throw error;
     }
 });
