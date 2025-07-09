@@ -272,29 +272,6 @@ export const onCircleDeleted = onDocumentDeleted('circles/{circleId}', async (ev
         await deleteSubCollection(users1Ref);
         console.log(`All documents in 'users' sub-collection under circle ${circleId} deleted.`);
 
-        // // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
-        // const usersSnapshot = await db.collection('users').get();
-
-        // // Use Promise.all to process all users and their sub-collection deletions asynchronously
-        // await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
-        //     // Check the 'circleIds' list for matching documents
-        //     const userData = userDoc.data();
-        //     const circleIds = userData.circleIds;
-        //     const newCircleIds = circleIds.filter((i: string) => i !== circleId);
-
-        //     console.log(`Updating circleIds to ${newCircleIds}`);
-        //     userDoc.ref.update({circleIds: newCircleIds});
-
-        //     //     const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
-        //     //     const circles2Snapshot = await circles2Ref.get();
-
-        // //     // Loop over the found 'circles' documents and delete them
-        // //     await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
-        // //         await circles2Doc.ref.delete();
-        // //         console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
-        // //     }));
-        // }));
-
         // Get the user document where the userId matches (only if userId exists)
         if (userId) {
             const deviceToken = await getDeviceToken(userId);
@@ -706,7 +683,7 @@ async function processTrackWithGoogleRoads(userId: string, trackId: string, trac
         await trackRef.update(updateData);
 
         logger.info(`${userId}: Successfully updated track ${trackId} with ${snappedBreadcrumbs.length} snapped breadcrumbs`);
-        logger.info(`${userId}: Updated distance from ${trackData.distance.toFixed(2)} meters to ${totalDistanceMeters.toFixed(2)} meters for track ${trackId}`);
+        logger.info(`${userId}: Updated distance from ${(trackData.distance || 0).toFixed(2)} meters to ${totalDistanceMeters.toFixed(2)} meters for track ${trackId}`);
     } catch (error) {
         logger.error(`${userId}: Error processing track ${trackId} with Google Roads API: ${error}`);
 
@@ -721,6 +698,450 @@ async function processTrackWithGoogleRoads(userId: string, trackId: string, trac
             logger.error(`${userId}: Failed to update error status for track ${trackId}: ${updateError}`);
         }
     }
+}
+
+/**
+ * Processes a track through Google Directions API for route optimization
+ * @param {string} userId The user ID
+ * @param {string} trackId The track ID
+ * @param {any} trackData The track data
+ * @param {admin.firestore.DocumentReference} trackRef The track document reference
+ */
+async function processTrackWithGoogleDirections(userId: string, trackId: string, trackData: any, trackRef: admin.firestore.DocumentReference): Promise<void> {
+    try {
+        logger.info(`${userId}: Starting Google Directions API processing for track ${trackId}`);
+
+        // Validate breadcrumbs exist and meet minimum requirements for Directions processing
+        if (!trackData.breadcrumbs || !Array.isArray(trackData.breadcrumbs) || trackData.breadcrumbs.length < 2) {
+            logger.info(`${userId}: Track ${trackId} has insufficient breadcrumbs (${trackData.breadcrumbs?.length || 0}), skipping Directions processing`);
+            return;
+        }
+
+        // Check if already processed to avoid reprocessing
+        if (trackData.processedWithDirections === true) {
+            logger.info(`${userId}: Track ${trackId} already processed with Google Directions, skipping Directions processing`);
+            return;
+        }
+
+        logger.info(`${userId}: Processing ${trackData.breadcrumbs.length} breadcrumbs for track ${trackId} with Google Directions API`);
+
+        // Sort breadcrumbs by timestamp (Firestore Timestamp objects) to ensure chronological order
+        const breadcrumbs = [...trackData.breadcrumbs].sort((a, b) => {
+            // Handle missing timestamps
+            if (!a.timestamp && !b.timestamp) return 0;
+            if (!a.timestamp) return 1;
+            if (!b.timestamp) return -1;
+
+            // For Firestore Timestamps, use toMillis() method
+            const aTime = a.timestamp.toMillis();
+            const bTime = b.timestamp.toMillis();
+
+            return aTime - bTime;
+        });
+
+        logger.info(`${userId}: Sorted ${breadcrumbs.length} breadcrumbs chronologically for track ${trackId}`);
+
+        // Get Google API key from Firebase secrets (Firebase v2)
+        const googleApiKey = googleApiKeySecret.value();
+        if (!googleApiKey) {
+            logger.error(`${userId}: Google API key not configured in Firebase secrets, skipping Directions processing for track ${trackId}`);
+            return;
+        }
+
+        // Get start and end points from breadcrumbs
+        const startPoint = breadcrumbs[0];
+        const endPoint = breadcrumbs[breadcrumbs.length - 1];
+
+        if (!startPoint.latitude || !startPoint.longitude || !endPoint.latitude || !endPoint.longitude) {
+            logger.error(`${userId}: Invalid start or end coordinates for track ${trackId}`);
+            return;
+        }
+
+        logger.info(`${userId}: Original track bounds - Start: lat=${(startPoint.latitude || 0).toFixed(6)}, lng=${(startPoint.longitude || 0).toFixed(6)}, End: lat=${(endPoint.latitude || 0).toFixed(6)}, lng=${(endPoint.longitude || 0).toFixed(6)}`);
+
+        // Prepare waypoints for Directions API (excluding start and end points)
+        const allWaypoints = breadcrumbs.slice(1, -1).map((breadcrumb: any) =>
+            `${breadcrumb.latitude},${breadcrumb.longitude}`
+        );
+
+        // Google Directions API has a limit of 23 waypoints (25 total points including origin/destination)
+        const maxWaypointsPerRequest = 23;
+
+        // Waypoint selection strategy
+        const waypointSelectionStrategy = ('evenly_distributed' as 'evenly_distributed' | 'curvature_based' | 'distance_based'); // Options: 'evenly_distributed', 'curvature_based', 'distance_based'
+
+        /**
+         * Select waypoints evenly distributed across the entire track
+         * @param {string[]} allWaypoints Array of waypoint strings
+         * @param {number} maxCount Maximum number of waypoints to select
+         * @return {string[]} Selected waypoints
+         */
+        const selectEvenlyDistributedWaypoints = (allWaypoints: string[], maxCount: number): string[] => {
+            if (allWaypoints.length <= maxCount) return allWaypoints;
+
+            const step = (allWaypoints.length - 1) / (maxCount - 1);
+            const selected = [];
+
+            for (let i = 0; i < maxCount; i++) {
+                const index = Math.round(i * step);
+                selected.push(allWaypoints[index]);
+            }
+
+            return selected;
+        };
+
+        /**
+         * Select waypoints based on route curvature (turns, direction changes)
+         * @param {string[]} allWaypoints Array of waypoint strings
+         * @param {number} maxCount Maximum number of waypoints to select
+         * @return {string[]} Selected waypoints
+         */
+        const selectCurvatureBasedWaypoints = (allWaypoints: string[], maxCount: number): string[] => {
+            if (allWaypoints.length <= maxCount) return allWaypoints;
+
+            // Convert waypoint strings back to breadcrumb objects for calculation
+            const waypointBreadcrumbs = breadcrumbs.slice(1, -1);
+
+            // Calculate course changes between consecutive points
+            const courseChanges = [];
+            for (let i = 1; i < waypointBreadcrumbs.length - 1; i++) {
+                const prev = waypointBreadcrumbs[i - 1];
+                const curr = waypointBreadcrumbs[i];
+                const next = waypointBreadcrumbs[i + 1];
+
+                const course1 = calculateCourse(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+                const course2 = calculateCourse(curr.latitude, curr.longitude, next.latitude, next.longitude);
+
+                const courseChange = Math.abs(course2 - course1);
+                courseChanges.push({index: i, change: courseChange});
+            }
+
+            // Sort by course change (highest first) and take top waypoints
+            courseChanges.sort((a, b) => b.change - a.change);
+            const selectedIndices = courseChanges.slice(0, maxCount).map((item) => item.index);
+
+            // Sort indices to maintain order
+            selectedIndices.sort((a, b) => a - b);
+
+            return selectedIndices.map((i) => allWaypoints[i]);
+        };
+
+        /**
+         * Select waypoints based on distance from start (evenly spaced)
+         * @param {string[]} allWaypoints Array of waypoint strings
+         * @param {number} maxCount Maximum number of waypoints to select
+         * @return {string[]} Selected waypoints
+         */
+        const selectDistanceBasedWaypoints = (allWaypoints: string[], maxCount: number): string[] => {
+            if (allWaypoints.length <= maxCount) return allWaypoints;
+
+            const waypointBreadcrumbs = breadcrumbs.slice(1, -1);
+
+            // Calculate total distance
+            let totalDistance = 0;
+            for (let i = 1; i < waypointBreadcrumbs.length; i++) {
+                totalDistance += calculateDistanceMeters(
+                    waypointBreadcrumbs[i-1].latitude, waypointBreadcrumbs[i-1].longitude,
+                    waypointBreadcrumbs[i].latitude, waypointBreadcrumbs[i].longitude
+                );
+            }
+
+            const targetDistance = totalDistance / (maxCount - 1);
+            const selected = [];
+            let currentDistance = 0;
+
+            selected.push(allWaypoints[0]); // Always include first waypoint
+
+            for (let i = 1; i < waypointBreadcrumbs.length; i++) {
+                currentDistance += calculateDistanceMeters(
+                    waypointBreadcrumbs[i-1].latitude, waypointBreadcrumbs[i-1].longitude,
+                    waypointBreadcrumbs[i].latitude, waypointBreadcrumbs[i].longitude
+                );
+
+                if (currentDistance >= targetDistance * (selected.length) && selected.length < maxCount - 1) {
+                    selected.push(allWaypoints[i]);
+                }
+            }
+
+            // Always include last waypoint if not already included
+            if (selected.length < maxCount && !selected.includes(allWaypoints[allWaypoints.length - 1])) {
+                selected.push(allWaypoints[allWaypoints.length - 1]);
+            }
+
+            return selected;
+        };
+
+        // Select waypoints based on chosen strategy
+        let selectedWaypoints: string[];
+        switch (waypointSelectionStrategy) {
+        case 'curvature_based':
+            selectedWaypoints = selectCurvatureBasedWaypoints(allWaypoints, maxWaypointsPerRequest);
+            logger.info(`${userId}: Using curvature-based waypoint selection for track ${trackId}`);
+            break;
+        case 'distance_based':
+            selectedWaypoints = selectDistanceBasedWaypoints(allWaypoints, maxWaypointsPerRequest);
+            logger.info(`${userId}: Using distance-based waypoint selection for track ${trackId}`);
+            break;
+        case 'evenly_distributed':
+        default:
+            selectedWaypoints = selectEvenlyDistributedWaypoints(allWaypoints, maxWaypointsPerRequest);
+            logger.info(`${userId}: Using evenly distributed waypoint selection for track ${trackId}`);
+            break;
+        }
+
+        logger.info(`${userId}: Selected ${selectedWaypoints.length} waypoints from ${allWaypoints.length} total waypoints for track ${trackId}`);
+
+        // Build the Directions API URL with selected waypoints
+        const origin = `${startPoint.latitude},${startPoint.longitude}`;
+        const destination = `${endPoint.latitude},${endPoint.longitude}`;
+        const waypointsParam = selectedWaypoints.length > 0 ? `&waypoints=${encodeURIComponent(selectedWaypoints.join('|'))}` : '';
+
+        const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}${waypointsParam}&mode=driving&key=${googleApiKey}`;
+
+        logger.info(`${userId}: Calling Google Directions API for track ${trackId}`);
+
+        // Call Google Directions API
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            logger.error(`${userId}: Google Directions API error for track ${trackId}: ${response.status} - ${errorText}`);
+
+            // Mark as failed but don't throw to avoid retries
+            await trackRef.update({
+                directionsProcessingFailed: true,
+                directionsProcessingError: `API error: ${response.status}`,
+                directionsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            return;
+        }
+
+        const directionsResult = await response.json();
+
+        // Validate response structure
+        if (directionsResult.status !== 'OK' || !directionsResult.routes || directionsResult.routes.length === 0) {
+            logger.error(`${userId}: Invalid Google Directions API response for track ${trackId}: ${directionsResult.status}`);
+
+            await trackRef.update({
+                directionsProcessingFailed: true,
+                directionsProcessingError: `Invalid API response: ${directionsResult.status}`,
+                directionsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            return;
+        }
+
+        // Get the first (best) route
+        const route = directionsResult.routes[0];
+        const legs = route.legs;
+
+        if (!legs || legs.length === 0) {
+            logger.error(`${userId}: No route legs found for track ${trackId}`);
+            return;
+        }
+
+        logger.info(`${userId}: Successfully got route with ${legs.length} legs for track ${trackId}`);
+
+        // Extract all steps from all legs to create the route path
+        const allSteps: any[] = [];
+        legs.forEach((leg: any) => {
+            if (leg.steps && Array.isArray(leg.steps)) {
+                allSteps.push(...leg.steps);
+            }
+        });
+
+        // Create enhanced breadcrumbs from the route
+        const enhancedBreadcrumbs: any[] = [];
+        let currentIndex = 0;
+
+        // Add start point
+        enhancedBreadcrumbs.push({
+            latitude: startPoint.latitude,
+            longitude: startPoint.longitude,
+            timestamp: startPoint.timestamp,
+            accuracy: null, // Route-based accuracy
+            altitude: startPoint.altitude || null,
+            speed: startPoint.speed || null,
+            course: startPoint.course || null,
+            wasProcessedWithDirections: true,
+            stepIndex: currentIndex++,
+            originalBreadcrumbIndex: 0,
+        });
+
+        // Process each step to extract intermediate points
+        for (let i = 0; i < allSteps.length; i++) {
+            const step = allSteps[i];
+
+            // Decode the polyline to get intermediate points
+            if (step.polyline && step.polyline.points) {
+                const decodedPoints = decodePolyline(step.polyline.points);
+
+                // Add intermediate points (skip first point as it's the same as previous step's end)
+                for (let j = 1; j < decodedPoints.length; j++) {
+                    const point = decodedPoints[j];
+
+                    // Find the closest original breadcrumb to infer timing
+                    const closestOriginal = findClosestOriginalBreadcrumb(
+                        point.lat,
+                        point.lng,
+                        breadcrumbs
+                    );
+
+                    // Interpolate timestamp based on progress through the route
+                    const progress = (i * decodedPoints.length + j) / (allSteps.length * decodedPoints.length);
+                    const startTime = startPoint.timestamp.toMillis();
+                    const endTime = endPoint.timestamp.toMillis();
+                    const interpolatedTime = startTime + (endTime - startTime) * progress;
+
+                    // Calculate speed and course
+                    const inferredSpeed = closestOriginal?.speed || null;
+                    let inferredCourse = null;
+
+                    if (j > 0) {
+                        const prevPoint = decodedPoints[j - 1];
+                        inferredCourse = calculateCourse(
+                            prevPoint.lat,
+                            prevPoint.lng,
+                            point.lat,
+                            point.lng
+                        );
+                    }
+
+                    enhancedBreadcrumbs.push({
+                        latitude: point.lat,
+                        longitude: point.lng,
+                        timestamp: admin.firestore.Timestamp.fromMillis(interpolatedTime),
+                        // accuracy: null, // Route-based accuracy
+                        altitude: closestOriginal?.altitude || null,
+                        speed: inferredSpeed,
+                        course: inferredCourse,
+                        // speedLimit: null, // Google Directions API doesn't provide speed limits
+                        // wasProcessedWithDirections: true,
+                        index: currentIndex++,
+                        originalBreadcrumbIndex: closestOriginal ? breadcrumbs.indexOf(closestOriginal) : null,
+                        // stepDistance: step.distance?.value || null, // Distance in meters
+                        // stepDuration: step.duration?.value || null, // Duration in seconds
+                    });
+
+                    // Log first few points for debugging
+                    if (currentIndex <= 3) {
+                        logger.info(`${userId}: Enhanced breadcrumb ${currentIndex-1}: lat=${(point.lat || 0).toFixed(6)}, lng=${(point.lng || 0).toFixed(6)}`);
+                    }
+                }
+            }
+        }
+
+        // Add end point if not already included
+        if (enhancedBreadcrumbs.length === 0 ||
+            enhancedBreadcrumbs[enhancedBreadcrumbs.length - 1].latitude !== endPoint.latitude ||
+            enhancedBreadcrumbs[enhancedBreadcrumbs.length - 1].longitude !== endPoint.longitude) {
+            enhancedBreadcrumbs.push({
+                latitude: endPoint.latitude,
+                longitude: endPoint.longitude,
+                timestamp: endPoint.timestamp,
+                altitude: endPoint.altitude || null,
+                speed: endPoint.speed || null,
+                course: endPoint.course || null,
+                wasProcessedWithDirections: true,
+                index: currentIndex++,
+                originalBreadcrumbIndex: breadcrumbs.length - 1,
+            });
+        }
+
+        // Calculate total distance and duration from the route
+        const totalDistanceMeters = legs.reduce((sum: number, leg: any) =>
+            sum + (leg.distance?.value || 0), 0
+        );
+        const totalDurationSeconds = legs.reduce((sum: number, leg: any) =>
+            sum + (leg.duration?.value || 0), 0
+        );
+
+        // Calculate average speed from route data
+        const avgSpeedMps = totalDurationSeconds > 0 ? totalDistanceMeters / totalDurationSeconds : 0;
+        const avgSpeedKph = avgSpeedMps * 3.6; // Convert m/s to km/h
+
+        // Update the existing track with enhanced data
+        const updateData = {
+            enhancedBreadcrumbs: enhancedBreadcrumbs,
+            processedWithDirections: true,
+            directionsProcessingFailed: false,
+            directionsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+            waypointSelectionStrategy: waypointSelectionStrategy, // Store which approach was used
+            routeSummary: {
+                totalDistance: totalDistanceMeters,
+                totalDuration: totalDurationSeconds,
+                averageSpeed: avgSpeedKph,
+                waypointCount: selectedWaypoints.length,
+                legCount: legs.length,
+                routePolyline: route.overview_polyline?.points || null,
+            },
+            // Update distance and duration with route data if available
+            ...(totalDistanceMeters > 0 && {distance: totalDistanceMeters}),
+            ...(totalDurationSeconds > 0 && {duration: totalDurationSeconds}),
+            // Update average speed if calculated
+            ...(avgSpeedKph > 0 && {avgSpeed: avgSpeedKph}),
+        };
+
+        await trackRef.update(updateData);
+
+        logger.info(`${userId}: Successfully updated track ${trackId} with ${enhancedBreadcrumbs.length} enhanced breadcrumbs`);
+        logger.info(`${userId}: Route distance: ${totalDistanceMeters.toFixed(2)} meters, duration: ${totalDurationSeconds.toFixed(2)} seconds`);
+    } catch (error) {
+        logger.error(`${userId}: Error processing track ${trackId} with Google Directions API: ${error}`);
+
+        // Mark as failed but don't throw to avoid infinite retries
+        try {
+            await trackRef.update({
+                directionsProcessingFailed: true,
+                directionsProcessingError: error instanceof Error ? error.message : 'Unknown error',
+                directionsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+        } catch (updateError) {
+            logger.error(`${userId}: Failed to update error status for track ${trackId}: ${updateError}`);
+        }
+    }
+}
+
+/**
+ * Decodes a Google polyline string into an array of lat/lng coordinates
+ * @param {string} encoded The encoded polyline string
+ * @return {Array} Array of {lat, lng} objects
+ */
+function decodePolyline(encoded: string): Array<{ lat: number, lng: number }> {
+    const points: Array<{ lat: number, lng: number }> = [];
+    let index = 0;
+    let lat = 0;
+    let lng = 0;
+
+    while (index < encoded.length) {
+        let b: number;
+        let shift = 0;
+        let result = 0;
+        do {
+            b = encoded.charCodeAt(index++) - 63;
+            result |= (b & 0x1f) << shift;
+            shift += 5;
+        } while (b >= 0x20);
+        const dlat = ((result & 1) ? ~(result >> 1) : (result >> 1));
+        lat += dlat;
+
+        shift = 0;
+        result = 0;
+        do {
+            b = encoded.charCodeAt(index++) - 63;
+            result |= (b & 0x1f) << shift;
+            shift += 5;
+        } while (b >= 0x20);
+        const dlng = ((result & 1) ? ~(result >> 1) : (result >> 1));
+        lng += dlng;
+
+        points.push({lat: lat / 1e5, lng: lng / 1e5});
+    }
+    return points;
 }
 
 /**
@@ -740,13 +1161,35 @@ export const onTrackCreated = onDocumentCreated({
         return;
     }
 
+    // Check if this track was created from a live track deletion
+    // if (trackData.fromLiveTrack === true) {
+    //     logger.info(`${userId}: Track ${trackId} was created from live track deletion, skipping enhancement processing`);
+
+    //     // Only create notification for live track conversions
+    //     await createTrackNotification(userId, trackId, trackData);
+    //     return;
+    // }
+
     logger.info(`${userId}: Processing new track ${trackId} - creating notification and processing with Google Roads API`);
 
-    // Execute both operations in parallel for better performance
-    await Promise.allSettled([
+    // Configuration: Choose which processing method to use
+    const useGoogleDirections = true; // Set to true for Directions API, false for Roads API
+
+    // Execute operations in parallel for better performance
+    const processingOperations = [
         createTrackNotification(userId, trackId, trackData),
-        processTrackWithGoogleRoads(userId, trackId, trackData, event.data!.ref),
-    ]);
+    ];
+
+    // Add the chosen processing method
+    if (useGoogleDirections) {
+        processingOperations.push(processTrackWithGoogleDirections(userId, trackId, trackData, event.data!.ref));
+        logger.info(`${userId}: Using Google Directions API for track ${trackId}`);
+    } else {
+        processingOperations.push(processTrackWithGoogleRoads(userId, trackId, trackData, event.data!.ref));
+        logger.info(`${userId}: Using Google Roads API for track ${trackId}`);
+    }
+
+    await Promise.allSettled(processingOperations);
 
     logger.info(`${userId}: Completed processing for track ${trackId}`);
 });
@@ -769,34 +1212,18 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
             let startTime: Timestamp | null = null;
             let endTime: Timestamp | null = null;
             let locationCount = 0;
-            // let totalDistance = 0;
-            // let prevLat: number | null = null;
-            // let prevLon: number | null = null;
             const breadcrumbs: any[] = [];
 
             // Process all locations in order
-            await Promise.all(locationsSnapshot.docs.map(async (doc) => {
+            await Promise.all(locationsSnapshot.docs.map(async (doc, index) => {
                 const locationData = doc.data();
                 const speed = locationData.speed || 0;
                 const timestamp = locationData.timestamp as Timestamp;
-                // const latitude = locationData.latitude;
-                // const longitude = locationData.longitude;
 
                 if (!(timestamp instanceof Timestamp)) {
                     console.error(`[User: ${userId}] Invalid timestamp format in location document`);
                     return;
                 }
-
-                // Calculate distance if we have previous coordinates
-                // if (prevLat !== null && prevLon !== null && latitude && longitude) {
-                //     const segmentDistance = calculateDistance(prevLat, prevLon, latitude, longitude);
-                //     // Only add distance if it's above a minimum threshold (10 meters) to filter GPS noise
-                //     if (segmentDistance >= 0.01) { // 0.01 km = 10 meters
-                //         totalDistance += segmentDistance;
-                //     }
-                // }
-                // prevLat = latitude;
-                // prevLon = longitude;
 
                 // Update metrics - ensure speed is a valid number
                 const validSpeed = (typeof speed === 'number' && !isNaN(speed)) ? speed : 0;
@@ -813,9 +1240,12 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     endTime = timestamp;
                 }
 
-                // Add location data to breadcrumbs array
+                // Add location data to breadcrumbs array with index
                 breadcrumbs.push({
                     ...locationData,
+                    index: index,
+                    originalBreadcrumbIndex: index,
+                    wasProcessedWithDirections: false,
                 });
             }));
 
@@ -905,7 +1335,7 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     averageSpeed: avgSpeed.toFixed(2),
                     maxSpeed: maxSpeed.toFixed(2),
                     duration: duration.toFixed(2),
-                    totalDistance: deletedData?.distance.toFixed(2),
+                    totalDistance: (deletedData?.distance || 0).toFixed(2),
                     locationCount,
                 });
             }
@@ -941,25 +1371,6 @@ export const onLiveTrackCreated = onDocumentCreated('users/{userId}/liveTracks/{
 
     return Promise.resolve();
 });
-
-// export const onLiveTrackUpdated = onDocumentUpdated('users/{userId}/liveTracks/{trackId}', async (event) => {
-//     const userId = event.params.userId;
-//     const trackId = event.params.trackId;
-//     const beforeData = event.data?.before.data();
-//     const afterData = event.data?.after.data();
-
-//     console.log(`[User: ${userId}] LiveTrack document with ID ${trackId} was updated`);
-//     console.log(`[User: ${userId}] Before data:`, beforeData);
-//     console.log(`[User: ${userId}] After data:`, afterData);
-
-//     try {
-//         // Delete all documents in the Locations subcollection
-//         const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
-//         await deleteSubCollection(locationsRef);
-//         // You can add any initialization logic here for new LiveTrack documents
-//         console.log(`[User: ${userId}] Successfully processed new LiveTrack creation for trackId: ${trackId}`);
-//     } catch (error) {
-//         console.error(`
 
 export const scheduledFunction = onSchedule({
     schedule: 'every 15 minutes',
