@@ -619,7 +619,9 @@ async function processTrackWithGoogleRoads(userId: string, trackId: string, trac
             );
 
             // Calculate speed and course if we have enough context
-            const inferredSpeed = originalBreadcrumb?.speed || null;
+            const inferredSpeed = originalBreadcrumb?.speed !== null && originalBreadcrumb?.speed !== undefined ?
+                originalBreadcrumb.speed :
+                0.0;
             let inferredCourse = originalBreadcrumb?.course || null;
             let inferredTimestamp = originalBreadcrumb?.timestamp || null;
 
@@ -963,12 +965,10 @@ async function processTrackWithGoogleDirections(userId: string, trackId: string,
             latitude: startPoint.latitude,
             longitude: startPoint.longitude,
             timestamp: startPoint.timestamp,
-            accuracy: null, // Route-based accuracy
             altitude: startPoint.altitude || null,
-            speed: startPoint.speed || null,
+            speed: startPoint.speed !== null && startPoint.speed !== undefined ? startPoint.speed : 0.0,
             course: startPoint.course || null,
-            wasProcessedWithDirections: true,
-            stepIndex: currentIndex++,
+            index: currentIndex++,
             originalBreadcrumbIndex: 0,
         });
 
@@ -998,7 +998,9 @@ async function processTrackWithGoogleDirections(userId: string, trackId: string,
                     const interpolatedTime = startTime + (endTime - startTime) * progress;
 
                     // Calculate speed and course
-                    const inferredSpeed = closestOriginal?.speed || null;
+                    const inferredSpeed = closestOriginal?.speed !== null && closestOriginal?.speed !== undefined ?
+                        closestOriginal.speed :
+                        0.0;
                     let inferredCourse = null;
 
                     if (j > 0) {
@@ -1044,7 +1046,7 @@ async function processTrackWithGoogleDirections(userId: string, trackId: string,
                 longitude: endPoint.longitude,
                 timestamp: endPoint.timestamp,
                 altitude: endPoint.altitude || null,
-                speed: endPoint.speed || null,
+                speed: endPoint.speed !== null && endPoint.speed !== undefined ? endPoint.speed : 0.0,
                 course: endPoint.course || null,
                 wasProcessedWithDirections: true,
                 index: currentIndex++,
@@ -1206,6 +1208,8 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
         // Get all locations before deletion
         const locationsRef = db.collection(`users/${userId}/liveTracks/${trackId}/locations`);
         const locationsSnapshot = await locationsRef.get();
+        console.log(`[User: ${userId}] Found ${locationsSnapshot.size} location documents for track ${trackId}`);
+
         if (!locationsSnapshot.empty) {
             let totalSpeed = 0;
             let maxSpeed = 0;
@@ -1263,12 +1267,12 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     avgSpeed: avgSpeed,
                 });
             } else {
-                // Create new track document with auto-generated ID
-                const newTrackRef = db.collection(`users/${userId}/tracks`).doc();
+                // Create new track document using the LiveTrack's ID
+                const newTrackRef = db.collection(`users/${userId}/tracks`).doc(trackId);
 
                 // Create track document with summary data
                 await newTrackRef.set({
-                    id: newTrackRef.id,
+                    id: trackId,
                     startTime,
                     endTime,
                     avgSpeed: avgSpeed,
@@ -1339,6 +1343,8 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     locationCount,
                 });
             }
+        } else {
+            console.log(`[User: ${userId}] No location documents found for track ${trackId}, skipping track creation`);
         }
 
         // Now delete the locations collection
@@ -1370,6 +1376,64 @@ export const onLiveTrackCreated = onDocumentCreated('users/{userId}/liveTracks/{
     }
 
     return Promise.resolve();
+});
+
+/**
+ * Scheduled function that runs every 10 minutes to expire old LiveTracks
+ * Automatically deletes LiveTracks that haven't been updated for more than 30 minutes
+ */
+export const expireOldLiveTracks = onSchedule({
+    schedule: 'every 10 minutes',
+    timeZone: 'UTC',
+}, async () => {
+    console.log('LiveTrack expiration check function triggered at:', new Date().toISOString());
+
+    try {
+        // Get all users
+        const usersSnapshot = await db.collection('users').get();
+
+        if (usersSnapshot.empty) {
+            console.log('No users found, skipping LiveTrack expiration check');
+            return;
+        }
+
+        let expiredCount = 0;
+        const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+        const thirtyMinutesAgoTimestamp = Timestamp.fromDate(thirtyMinutesAgo);
+
+        // Process each user's LiveTracks
+        for (const userDoc of usersSnapshot.docs) {
+            const userData = userDoc.data();
+            const userId = userData.userId;
+
+            if (!userId) continue;
+
+            // Get user's LiveTracks
+            const liveTracksSnapshot = await db.collection(`users/${userId}/liveTracks`).get();
+
+            for (const liveTrackDoc of liveTracksSnapshot.docs) {
+                const liveTrackData = liveTrackDoc.data();
+                const lastUpdate = liveTrackData.lastUpdate || liveTrackData.dateCreated;
+
+                // Check if LiveTrack is older than 30 minutes
+                if (lastUpdate && lastUpdate.toMillis() < thirtyMinutesAgoTimestamp.toMillis()) {
+                    try {
+                        console.log(`[User: ${userId}] Expiring LiveTrack ${liveTrackDoc.id} (last update: ${lastUpdate.toDate().toISOString()})`);
+
+                        // Delete the LiveTrack document (this will trigger onLiveTrackDeleted)
+                        await liveTrackDoc.ref.delete();
+                        expiredCount++;
+                    } catch (error) {
+                        console.error(`[User: ${userId}] Error expiring LiveTrack ${liveTrackDoc.id}:`, error);
+                    }
+                }
+            }
+        }
+
+        console.log(`Expired ${expiredCount} old LiveTracks`);
+    } catch (error) {
+        console.error('Error in LiveTrack expiration function:', error);
+    }
 });
 
 export const scheduledFunction = onSchedule({
