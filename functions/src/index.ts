@@ -680,6 +680,7 @@ async function processTrackWithGoogleRoads(userId: string, trackId: string, trac
             distance: totalDistanceMeters, // Use calculated distance from snapped points (in meters)
             roadsProcessingFailed: false,
             roadsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+            processingApiUsed: 'Google Roads API', // Record which API was used
         };
 
         await trackRef.update(updateData);
@@ -1073,6 +1074,7 @@ async function processTrackWithGoogleDirections(userId: string, trackId: string,
             directionsProcessingFailed: false,
             directionsProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
             waypointSelectionStrategy: waypointSelectionStrategy, // Store which approach was used
+            processingApiUsed: 'Google Directions API', // Record which API was used
             routeSummary: {
                 totalDistance: totalDistanceMeters,
                 totalDuration: totalDurationSeconds,
@@ -1334,7 +1336,7 @@ async function processTrackWithGoogleRoutes(userId: string, trackId: string, tra
         const requestBody = {
             origin: origin,
             destination: destination,
-            ...(waypoints.length > 0 && {waypoints: waypoints}),
+            ...(waypoints.length > 0 && {intermediates: waypoints}),
             travelMode: 'DRIVE',
             routingPreference: 'TRAFFIC_AWARE',
             computeAlternativeRoutes: false,
@@ -1507,10 +1509,10 @@ async function processTrackWithGoogleRoutes(userId: string, trackId: string, tra
 
         // Calculate total distance and duration from the route
         const totalDistanceMeters = legs.reduce((sum: number, leg: any) =>
-            sum + (leg.distanceMeters || 0), 0,
+            sum + (Number(leg.distanceMeters) || 0), 0,
         );
         const totalDurationSeconds = legs.reduce((sum: number, leg: any) =>
-            sum + (leg.staticDuration || 0), 0,
+            sum + (Number(leg.staticDuration) || 0), 0,
         );
 
         // Calculate average speed from route data
@@ -1524,6 +1526,7 @@ async function processTrackWithGoogleRoutes(userId: string, trackId: string, tra
             routesProcessingFailed: false,
             routesProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
             waypointSelectionStrategy: waypointSelectionStrategy, // Store which approach was used
+            processingApiUsed: 'Google Routes API', // Record which API was used
             routeSummary: {
                 totalDistance: totalDistanceMeters,
                 totalDuration: totalDurationSeconds,
@@ -1741,6 +1744,7 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     startAddress: deletedData?.startAddress,
                     endAddress: deletedData?.endAddress,
                     screenAccessCount: deletedData?.screenAccessCount,
+                    events: deletedData?.events || [],
                 });
 
                 // Get user's circles and notify circle members
