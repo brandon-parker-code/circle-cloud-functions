@@ -101,6 +101,17 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
                 title: title,
                 body: body,
             },
+            apns: {
+                payload: {
+                    aps: {
+                        sound: 'default',
+                    },
+                },
+                headers: {
+                    'apns-priority': '10',
+                    'apns-push-type': 'alert',
+                },
+            },
         };
 
         console.log(message);
@@ -116,31 +127,31 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
  * @param {string} content data content
  * @return {Promise<string> | null} The deviceToken or null
  */
-async function sendSilentPushNotification(deviceToken: string, content: string): Promise<string | null> {
-    if (deviceToken) {
-        const message = {
-            token: deviceToken,
-            apns: {
-                headers: {
-                    'apns-push-type': 'background',
-                    'apns-priority': '5',
-                    // No apns-topic needed - Firebase auto-detects!
-                },
-                payload: {
-                    aps: {
-                        'content-available': 1,
-                    },
-                    shouldTrack: true,
-                    timestamp: Date.now(),
-                },
-            },
-        };
+// async function sendSilentPushNotification(deviceToken: string, content: string): Promise<string | null> {
+//     if (deviceToken) {
+//         const message = {
+//             token: deviceToken,
+//             apns: {
+//                 headers: {
+//                     'apns-push-type': 'background',
+//                     'apns-priority': '5',
+//                     // No apns-topic needed - Firebase auto-detects!
+//                 },
+//                 payload: {
+//                     aps: {
+//                         'content-available': 1,
+//                     },
+//                     shouldTrack: true,
+//                     timestamp: Date.now(),
+//                 },
+//             },
+//         };
 
-        console.log(JSON.stringify(message, null, 2));
-        return await admin.messaging().send(message);
-    }
-    return null;
-}
+//         console.log(JSON.stringify(message, null, 2));
+//         return await admin.messaging().send(message);
+//     }
+//     return null;
+// }
 
 /**
  * deletes and entire sub collection
@@ -1895,66 +1906,66 @@ export const expireOldLiveTracks = onSchedule({
     }
 });
 
-export const scheduledFunction = onSchedule({
-    schedule: 'every 15 minutes',
-    timeZone: 'UTC',
-}, async () => {
-    console.log('Scheduled function triggered at:', new Date().toISOString());
+// export const scheduledFunction = onSchedule({
+//     schedule: 'every 15 minutes',
+//     timeZone: 'UTC',
+// }, async () => {
+//     console.log('Scheduled function triggered at:', new Date().toISOString());
 
-    try {
-        // Get all users from the users collection
-        const usersSnapshot = await db.collection('users').get();
+//     try {
+//         // Get all users from the users collection
+//         const usersSnapshot = await db.collection('users').get();
 
-        if (usersSnapshot.empty) {
-            console.log('No users found in the database');
-            return;
-        }
+//         if (usersSnapshot.empty) {
+//             console.log('No users found in the database');
+//             return;
+//         }
 
-        console.log(`Found ${usersSnapshot.size} users to process`);
+//         console.log(`Found ${usersSnapshot.size} users to process`);
 
-        // Process each user and send a silent notification
-        const notificationPromises = usersSnapshot.docs.map(async (userDoc) => {
-            const userData = userDoc.data();
-            const userId = userData.userId;
+//         // Process each user and send a silent notification
+//         const notificationPromises = usersSnapshot.docs.map(async (userDoc) => {
+//             const userData = userDoc.data();
+//             const userId = userData.userId;
 
-            if (!userId) {
-                console.log(`User document ${userDoc.id} has no userId field, skipping`);
-                return;
-            }
+//             if (!userId) {
+//                 console.log(`User document ${userDoc.id} has no userId field, skipping`);
+//                 return;
+//             }
 
-            // Get the device token for this user
-            const deviceToken = await getDeviceToken(userId);
+//             // Get the device token for this user
+//             const deviceToken = await getDeviceToken(userId);
 
-            if (!deviceToken) {
-                console.log(`No device token found for user ${userId}, skipping notification`);
-                return;
-            }
+//             if (!deviceToken) {
+//                 console.log(`No device token found for user ${userId}, skipping notification`);
+//                 return;
+//             }
 
-            // Create notification content
-            const content = JSON.stringify({
-                action: 'refresh',
-                timestamp: new Date().toISOString(),
-            });
+//             // Create notification content
+//             const content = JSON.stringify({
+//                 action: 'refresh',
+//                 timestamp: new Date().toISOString(),
+//             });
 
-            // Send the silent notification
-            const result = await sendSilentPushNotification(deviceToken, content);
+//             // Send the silent notification
+//             const result = await sendSilentPushNotification(deviceToken, content);
 
-            if (result) {
-                console.log(`Successfully sent silent notification to user ${userId}`);
-            } else {
-                console.log(`Failed to send silent notification to user ${userId}`);
-            }
-        });
+//             if (result) {
+//                 console.log(`Successfully sent silent notification to user ${userId}`);
+//             } else {
+//                 console.log(`Failed to send silent notification to user ${userId}`);
+//             }
+//         });
 
-        // Wait for all notifications to be sent
-        await Promise.all(notificationPromises);
+//         // Wait for all notifications to be sent
+//         await Promise.all(notificationPromises);
 
-        console.log('Scheduled function completed successfully');
-    } catch (error) {
-        console.error('Error in scheduled function:', error);
-        throw error;
-    }
-});
+//         console.log('Scheduled function completed successfully');
+//     } catch (error) {
+//         console.error('Error in scheduled function:', error);
+//         throw error;
+//     }
+// });
 
 /**
  * Scheduled function that runs every 20 minutes to check user activity
