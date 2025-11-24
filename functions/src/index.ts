@@ -1783,7 +1783,7 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
 
                                             if (deviceToken) {
                                                 const title = 'New Track';
-                                                const body = `${userName} completed a track: ${deletedData?.name || 'Untitled Track'}`;
+                                                const body = `${userName} completed new drive`;
 
                                                 // Send push notification
                                                 await sendPushNotification(deviceToken, title, body);
