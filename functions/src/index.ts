@@ -35,6 +35,14 @@ interface TrackNotification {
     duration: number;
 }
 
+interface BatteryNotification {
+    title: string;
+    body: string;
+    batteryLevel: number;
+    lowBatteryUserId: string;
+    lowBatteryUserName: string;
+}
+
 interface Notification {
     id: string;
     userId: string;
@@ -42,6 +50,7 @@ interface Notification {
     userName: string;
     trackNotification: TrackNotification | undefined;
     locationNotification: LocationNotification | undefined;
+    batteryNotification: BatteryNotification | undefined;
     dateCreated: FirebaseFirestore.Timestamp;
 }
 
@@ -57,6 +66,49 @@ interface Circle {
     ownerId: string;
     dateCreated: Timestamp;
     users: [CircleUser] | undefined
+}
+
+/**
+ * Gets the count and last notification time for battery notifications about a specific low-battery user
+ * @param {string} recipientUserId The userId of the recipient
+ * @param {string} lowBatteryUserId The userId of the user with low battery
+ * @return {Promise<Object>} The count and last notification time
+ */
+async function getBatteryNotificationCount(recipientUserId: string, lowBatteryUserId: string): Promise<{count: number, lastNotificationTime: Timestamp | null}> {
+    try {
+        const notificationsRef = db.collection(`users/${recipientUserId}/notifications`);
+        const notificationsSnapshot = await notificationsRef.get();
+
+        if (notificationsSnapshot.empty) {
+            return {count: 0, lastNotificationTime: null};
+        }
+
+        // Filter for notifications that have batteryNotification field and match the low-battery user
+        let count = 0;
+        let lastNotificationTime: Timestamp | null = null;
+
+        for (const doc of notificationsSnapshot.docs) {
+            const data = doc.data();
+            if (data.batteryNotification !== undefined &&
+                data.batteryNotification !== null &&
+                data.batteryNotification.lowBatteryUserId === lowBatteryUserId) {
+                count++;
+
+                // Track the most recent notification time
+                if (data.dateCreated instanceof Timestamp) {
+                    if (!lastNotificationTime || data.dateCreated.toMillis() > lastNotificationTime.toMillis()) {
+                        lastNotificationTime = data.dateCreated;
+                    }
+                }
+            }
+        }
+
+        return {count, lastNotificationTime};
+    } catch (error) {
+        console.error(`Error counting battery notifications for user ${recipientUserId} about ${lowBatteryUserId}:`, error);
+        // Return 0 on error to allow notification (fail open)
+        return {count: 0, lastNotificationTime: null};
+    }
 }
 
 /**
@@ -441,6 +493,7 @@ export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', a
             userName: userName, // userName for the ser that generated th even
             trackNotification: undefined, // set undefined
             locationNotification: locationNotification, // Message Title
+            batteryNotification: undefined, // set undefined
             dateCreated: Timestamp.now(), // Firestore timestamp
         };
 
@@ -494,6 +547,7 @@ async function createTrackNotification(userId: string, trackId: string, trackDat
             userName: trackData.name || 'Unknown User', // userName for the user that generated the event
             trackNotification: trackNotification,
             locationNotification: undefined, // set undefined for track notifications
+            batteryNotification: undefined, // set undefined for track notifications
             dateCreated: Timestamp.now(), // Firestore timestamp
         };
 
@@ -2046,6 +2100,256 @@ export const checkUserActivity = onSchedule({
         console.log(`User activity check completed: ${updatedCount} users updated to stationary, ${skippedCount} users skipped`);
     } catch (error) {
         console.error('Error in user activity check function:', error);
+        throw error;
+    }
+});
+
+/**
+ * Scheduled function that runs every 5 minutes to check for low battery levels
+ * Sends alerts to circle members when a user's battery is 10% or less
+ */
+export const checkLowBatteryAlerts = onSchedule({
+    schedule: 'every 5 minutes',
+    timeZone: 'UTC',
+}, async () => {
+    console.log('Low battery alert check function triggered at:', new Date().toISOString());
+
+    // Notification limits and timing constants
+    const MAX_BATTERY_NOTIFICATIONS = 3;
+    const COOLDOWN_PERIOD_MS = 60 * 60 * 1000; // 1 hour in milliseconds
+    const RESET_THRESHOLD_MS = 6 * 60 * 60 * 1000; // 6 hours in milliseconds
+
+    try {
+        // Get all users from the users collection
+        const usersSnapshot = await db.collection('users').get();
+
+        if (usersSnapshot.empty) {
+            console.log('No users found in the database');
+            return;
+        }
+
+        console.log(`Found ${usersSnapshot.size} users to check for low battery`);
+
+        let lowBatteryCount = 0;
+        let notificationCount = 0;
+
+        // Process each user to check their battery level
+        for (const userDoc of usersSnapshot.docs) {
+            const userData = userDoc.data();
+            const userId = userData.userId;
+            const batteryLevel = userData.batteryLevel;
+            const userName = userData.name || 'Someone';
+            const dateUpdated = userData.dateUpdated;
+
+            if (!userId) {
+                console.log(`User document ${userDoc.id} has no userId field, skipping`);
+                continue;
+            }
+
+            // Check if dateUpdated is less than 10 minutes old
+            if (dateUpdated) {
+                if (!(dateUpdated instanceof Timestamp)) {
+                    console.log(`[User: ${userId}] dateUpdated is not a valid Timestamp, skipping`);
+                    continue;
+                }
+
+                const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+                const tenMinutesAgoTimestamp = Timestamp.fromDate(tenMinutesAgo);
+
+                if (dateUpdated.toMillis() < tenMinutesAgoTimestamp.toMillis()) {
+                    console.log(`[User: ${userId}] dateUpdated is older than 10 minutes (${dateUpdated.toDate().toISOString()}), skipping battery check`);
+                    continue;
+                }
+            } else {
+                console.log(`[User: ${userId}] No dateUpdated field found, skipping battery check`);
+                continue;
+            }
+
+            // Check if battery level is 0.10 or less
+            if (batteryLevel !== undefined && batteryLevel !== null && batteryLevel <= 0.10) {
+                try {
+                    console.log(`[User: ${userId}] Battery level is low: ${batteryLevel}`);
+                    lowBatteryCount++;
+
+                    // Get user's circles
+                    const circleIds = userData.circleIds || [];
+
+                    if (circleIds.length === 0) {
+                        console.log(`[User: ${userId}] User has no circles, skipping notification`);
+                        continue;
+                    }
+
+                    // Fetch all circle documents and collect users
+                    const circlePromises = circleIds.map(async (circleId: string) => {
+                        try {
+                            const circleDoc = await db.collection('circles').doc(circleId).get();
+                            if (circleDoc.exists) {
+                                const circleData = circleDoc.data();
+                                const circleUsers = circleData?.users || [];
+                                return circleUsers;
+                            }
+                            return [];
+                        } catch (error) {
+                            console.error(`[User: ${userId}] Error fetching circle ${circleId}:`, error);
+                            return [];
+                        }
+                    });
+
+                    const circleUsersArrays = await Promise.all(circlePromises);
+
+                    // Combine all users from all circles and deduplicate by userId
+                    const allUsersMap = new Map<string, CircleUser>();
+                    for (const usersArray of circleUsersArrays) {
+                        for (const user of usersArray) {
+                            if (user && user.id) {
+                                allUsersMap.set(user.id, user);
+                            }
+                        }
+                    }
+
+                    const uniqueUsers = Array.from(allUsersMap.values());
+                    console.log(`[User: ${userId}] Found ${uniqueUsers.length} unique users across ${circleIds.length} circles`);
+
+                    // Check notification settings and send alerts
+                    const notificationPromises = uniqueUsers.map(async (circleUser: CircleUser) => {
+                        try {
+                            // Check if notificationSettings document exists
+                            const notificationSettingsRef = db.collection('users').doc(circleUser.id).collection('notificationSettings');
+                            const notificationSettingsSnapshot = await notificationSettingsRef.get();
+
+                            let shouldSendAlert = false;
+
+                            if (notificationSettingsSnapshot.empty) {
+                                // No notificationSettings collection exists, send alert
+                                shouldSendAlert = true;
+                                console.log(`[User: ${userId}] No notificationSettings found for user ${circleUser.id}, will send alert`);
+                            } else {
+                                // Check if any document has lowBatteryAlert = true
+                                for (const settingsDoc of notificationSettingsSnapshot.docs) {
+                                    const settingsData = settingsDoc.data();
+                                    if (settingsData.lowBatteryAlert === true) {
+                                        shouldSendAlert = true;
+                                        console.log(`[User: ${userId}] User ${circleUser.id} has lowBatteryAlert enabled`);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (shouldSendAlert) {
+                                // Get notification count and last notification time for this low-battery user
+                                const {count, lastNotificationTime} = await getBatteryNotificationCount(circleUser.id, userId);
+                                const now = Timestamp.now();
+                                const nowMillis = now.toMillis();
+
+                                // Check cooldown period (1 hour)
+                                if (lastNotificationTime) {
+                                    const timeSinceLastNotification = nowMillis - lastNotificationTime.toMillis();
+                                    if (timeSinceLastNotification < COOLDOWN_PERIOD_MS) {
+                                        const minutesAgo = Math.floor(timeSinceLastNotification / (60 * 1000));
+                                        console.log(`[User: ${userId}] Skipping notification to user ${circleUser.id} - cooldown period active (last notification ${minutesAgo} minutes ago)`);
+                                        return;
+                                    }
+                                }
+
+                                // Check limit and reset mechanism
+                                let shouldSend = false;
+                                if (count < MAX_BATTERY_NOTIFICATIONS) {
+                                    // Under limit, send notification
+                                    shouldSend = true;
+                                } else if (count >= MAX_BATTERY_NOTIFICATIONS) {
+                                    // At or over limit, check if reset threshold has passed
+                                    if (lastNotificationTime) {
+                                        const timeSinceLastNotification = nowMillis - lastNotificationTime.toMillis();
+                                        if (timeSinceLastNotification >= RESET_THRESHOLD_MS) {
+                                            // Reset threshold passed, allow sending again
+                                            shouldSend = true;
+                                            console.log(`[User: ${userId}] Reset threshold passed for user ${circleUser.id} - last notification was ${Math.floor(timeSinceLastNotification / (60 * 60 * 1000))} hours ago, allowing notification`);
+                                        } else {
+                                            // Still within reset threshold, skip
+                                            const hoursAgo = Math.floor(timeSinceLastNotification / (60 * 60 * 1000));
+                                            console.log(`[User: ${userId}] Skipping notification to user ${circleUser.id} - already received ${count} notifications about this user (last notification ${hoursAgo} hours ago, reset threshold: 6 hours)`);
+                                            return;
+                                        }
+                                    } else {
+                                        // No last notification time but count >= 3, skip to be safe
+                                        console.log(`[User: ${userId}] Skipping notification to user ${circleUser.id} - already received ${count} notifications about this user`);
+                                        return;
+                                    }
+                                }
+
+                                if (!shouldSend) {
+                                    return;
+                                }
+
+                                const title = 'Low battery level alert';
+                                const body = `${userName}'s battery is low`;
+
+                                // Create notification record first (like location notifications do)
+                                try {
+                                    // Create a new document reference to get the ID before writing
+                                    // Use circleUser.id directly like location notifications do
+                                    const notificationRef = db.collection(`users/${circleUser.id}/notifications`).doc();
+
+                                    // Create a battery notification object with strong typing
+                                    const batteryNotification: BatteryNotification = {
+                                        title: title,
+                                        body: body,
+                                        batteryLevel: batteryLevel,
+                                        lowBatteryUserId: userId,
+                                        lowBatteryUserName: userName,
+                                    };
+
+                                    // Use the first circleId or empty string if no circles
+                                    const firstCircleId = circleIds.length > 0 ? circleIds[0] : '';
+
+                                    // Create the notification object with strong typing
+                                    const notificationData: Notification = {
+                                        id: notificationRef.id, // Store the generated ID
+                                        userId: circleUser.id, // userId for the recipient
+                                        circleId: firstCircleId, // The first circleId from the low-battery user's circles
+                                        userName: userName, // userName for the user with low battery
+                                        trackNotification: undefined, // set undefined
+                                        locationNotification: undefined, // set undefined
+                                        batteryNotification: batteryNotification,
+                                        dateCreated: Timestamp.now(), // Firestore timestamp
+                                    };
+
+                                    // Insert into user's 'notifications' subcollection
+                                    await notificationRef.set(notificationData);
+                                    console.log(`[User: ${userId}] Created notification record for user ${circleUser.id}`);
+                                } catch (error) {
+                                    // Log error but don't throw - notification record creation failure shouldn't stop other processing
+                                    console.error(`[User: ${userId}] Error creating notification record for user ${circleUser.id}:`, error);
+                                }
+
+                                // Get device token for the user and send push notification
+                                const deviceToken = await getDeviceToken(circleUser.id);
+                                if (deviceToken) {
+                                    // Send push notification
+                                    await sendPushNotification(deviceToken, title, body);
+                                    console.log(`[User: ${userId}] Sent low battery alert to user ${circleUser.id}`);
+                                    notificationCount++;
+                                } else {
+                                    console.log(`[User: ${userId}] No device token found for user ${circleUser.id}, skipping push notification`);
+                                }
+                            } else {
+                                console.log(`[User: ${userId}] User ${circleUser.id} has lowBatteryAlert disabled, skipping notification`);
+                            }
+                        } catch (error) {
+                            console.error(`[User: ${userId}] Error processing notification for user ${circleUser.id}:`, error);
+                        }
+                    });
+
+                    await Promise.all(notificationPromises);
+                } catch (error) {
+                    console.error(`[User: ${userId}] Error processing low battery alert:`, error);
+                }
+            }
+        }
+
+        console.log(`Low battery alert check completed: ${lowBatteryCount} users with low battery, ${notificationCount} notifications sent`);
+    } catch (error) {
+        console.error('Error in low battery alert check function:', error);
         throw error;
     }
 });
