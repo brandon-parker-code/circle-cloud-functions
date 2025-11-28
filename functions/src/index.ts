@@ -72,9 +72,10 @@ interface Circle {
  * Gets the count and last notification time for battery notifications about a specific low-battery user
  * @param {string} recipientUserId The userId of the recipient
  * @param {string} lowBatteryUserId The userId of the user with low battery
+ * @param {Timestamp | null} batteryRecoveryDate The date when the battery last recovered above 0.10
  * @return {Promise<Object>} The count and last notification time
  */
-async function getBatteryNotificationCount(recipientUserId: string, lowBatteryUserId: string): Promise<{count: number, lastNotificationTime: Timestamp | null}> {
+async function getBatteryNotificationCount(recipientUserId: string, lowBatteryUserId: string, batteryRecoveryDate: Timestamp | null): Promise<{count: number, lastNotificationTime: Timestamp | null}> {
     try {
         const notificationsRef = db.collection(`users/${recipientUserId}/notifications`);
         const notificationsSnapshot = await notificationsRef.get();
@@ -92,6 +93,17 @@ async function getBatteryNotificationCount(recipientUserId: string, lowBatteryUs
             if (data.batteryNotification !== undefined &&
                 data.batteryNotification !== null &&
                 data.batteryNotification.lowBatteryUserId === lowBatteryUserId) {
+                // Only count notifications sent after the battery recovery date (if it exists)
+                // This allows the alert process to start fresh after battery recovers
+                if (batteryRecoveryDate !== null && batteryRecoveryDate !== undefined && batteryRecoveryDate instanceof Timestamp) {
+                    if (data.dateCreated instanceof Timestamp) {
+                        // Only count if notification was sent after recovery
+                        if (data.dateCreated.toMillis() <= batteryRecoveryDate.toMillis()) {
+                            continue; // Skip this notification, it was before recovery
+                        }
+                    }
+                }
+
                 count++;
 
                 // Track the most recent notification time
@@ -1810,6 +1822,8 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     endAddress: deletedData?.endAddress,
                     screenAccessCount: deletedData?.screenAccessCount,
                     events: deletedData?.events || [],
+                    startMetadata: deletedData?.startMetadata,
+                    endMetadata: deletedData?.endMetadata,
                 });
 
                 // Get user's circles and notify circle members
@@ -2165,6 +2179,27 @@ export const checkLowBatteryAlerts = onSchedule({
                 continue;
             }
 
+            // Check if battery has recovered (above 0.10) and update batteryRecoveryDate
+            if (batteryLevel !== undefined && batteryLevel !== null && batteryLevel > 0.10) {
+                try {
+                    const batteryRecoveryDate = userData.batteryRecoveryDate;
+                    const shouldUpdateRecoveryDate = !batteryRecoveryDate ||
+                        (dateUpdated && dateUpdated instanceof Timestamp &&
+                         batteryRecoveryDate instanceof Timestamp &&
+                         dateUpdated.toMillis() > batteryRecoveryDate.toMillis());
+                    if (shouldUpdateRecoveryDate) {
+                        // Update batteryRecoveryDate to mark recovery
+                        await userDoc.ref.update({
+                            batteryRecoveryDate: Timestamp.now(),
+                        });
+                        console.log(`[User: ${userId}] Battery recovered to ${batteryLevel}, updated batteryRecoveryDate`);
+                    }
+                } catch (error) {
+                    console.error(`[User: ${userId}] Error updating batteryRecoveryDate:`, error);
+                }
+                continue; // Skip low battery check for this user
+            }
+
             // Check if battery level is 0.10 or less
             if (batteryLevel !== undefined && batteryLevel !== null && batteryLevel <= 0.10) {
                 try {
@@ -2237,7 +2272,9 @@ export const checkLowBatteryAlerts = onSchedule({
 
                             if (shouldSendAlert) {
                                 // Get notification count and last notification time for this low-battery user
-                                const {count, lastNotificationTime} = await getBatteryNotificationCount(circleUser.id, userId);
+                                // Pass batteryRecoveryDate to only count notifications from the current low-battery episode
+                                const batteryRecoveryDate = userData.batteryRecoveryDate || null;
+                                const {count, lastNotificationTime} = await getBatteryNotificationCount(circleUser.id, userId, batteryRecoveryDate);
                                 const now = Timestamp.now();
                                 const nowMillis = now.toMillis();
 
