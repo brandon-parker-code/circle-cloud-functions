@@ -2,13 +2,12 @@
 // import * as functions from 'firebase-functions';
 import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
-import {onDocumentCreated, onDocumentDeleted} from 'firebase-functions/v2/firestore';
+import {onDocumentCreated, onDocumentDeleted, onDocumentUpdated} from 'firebase-functions/v2/firestore';
 import {onSchedule} from 'firebase-functions/v2/scheduler';
 import {defineSecret} from 'firebase-functions/params';
 // import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
 // import {getStorage} from 'firebase-admin/storage';
-// import {HttpsError, onCall} from 'firebase-functions/v2/https';
 import {logger} from 'firebase-functions/v2';
 
 initializeApp();
@@ -66,6 +65,13 @@ interface Circle {
     ownerId: string;
     dateCreated: Timestamp;
     users: [CircleUser] | undefined
+}
+
+interface Praise {
+    givenByUserId: string;
+    givenByName: string;
+    givenAt: Timestamp;
+    message?: string;
 }
 
 /**
@@ -2390,3 +2396,69 @@ export const checkLowBatteryAlerts = onSchedule({
         throw error;
     }
 });
+
+/**
+ * Firestore trigger that detects when a praise is added to a track document
+ * Sends push notification to the track owner when a new praise is detected
+ * This works with Option 2 (direct Firestore writes from iOS app)
+ */
+export const onTrackPraiseAdded = onDocumentUpdated(
+    'users/{userId}/tracks/{trackId}',
+    async (event) => {
+        const userId = event.params.userId;
+        const trackId = event.params.trackId;
+
+        if (!event.data) {
+            console.log(`[Track: ${trackId}] No data in update event, skipping`);
+            return;
+        }
+
+        const beforeData = event.data.before.data();
+        const afterData = event.data.after.data();
+
+        try {
+            // Get the praises arrays
+            const beforePraises = beforeData?.praises || [];
+            const afterPraises = afterData?.praises || [];
+
+            // Check if a new praise was added (array length increased)
+            if (afterPraises.length > beforePraises.length) {
+                // Find the new praise (the one that wasn't in the before array)
+                const newPraise = afterPraises.find((praise: Praise) => {
+                    // Check if this praise exists in the before array
+                    return !beforePraises.some((oldPraise: Praise) =>
+                        oldPraise.givenByUserId === praise.givenByUserId &&
+                        oldPraise.givenAt.toMillis() === praise.givenAt.toMillis()
+                    );
+                });
+
+                if (newPraise) {
+                    const praiseGiverName = newPraise.givenByName;
+                    const message = newPraise.message;
+
+                    // Get track owner's device token and send push notification
+                    const deviceToken = await getDeviceToken(userId);
+                    if (deviceToken) {
+                        const notificationTitle = 'Drive Praised!';
+                        const notificationBody = message ?
+                            `${praiseGiverName} praised your drive: "${message}"` :
+                            `${praiseGiverName} praised your drive!`;
+
+                        try {
+                            await sendPushNotification(deviceToken, notificationTitle, notificationBody);
+                            console.log(`[Track: ${trackId}] Sent praise notification to user ${userId} via Firestore trigger`);
+                        } catch (notificationError) {
+                            // Log error but don't throw - notification failure shouldn't break the trigger
+                            console.error(`[Track: ${trackId}] Failed to send praise notification to user ${userId}:`, notificationError);
+                        }
+                    } else {
+                        console.log(`[Track: ${trackId}] No device token found for user ${userId}, skipping push notification`);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(`[Track: ${trackId}] Error processing track praise trigger for user ${userId}:`, error);
+            // Don't throw - we don't want trigger failures to cause retries
+        }
+    }
+);
