@@ -1839,43 +1839,86 @@ export const onLiveTrackDeleted = onDocumentDeleted('users/{userId}/liveTracks/{
                     const circleIds = userData.circleIds || [];
                     const userName = userData.name || 'Someone';
 
-                    // Process each circle the user is a member of
+                    // Fetch all circle documents and collect users
                     const circlePromises = circleIds.map(async (circleId: string) => {
                         try {
                             const circleDoc = await db.collection('circles').doc(circleId).get();
                             if (circleDoc.exists) {
                                 const circleData = circleDoc.data();
                                 const circleUsers = circleData?.users || [];
-
-                                // Notify each user in the circle (except the track creator)
-                                const notificationPromises = circleUsers
-                                    // .filter((user: any) => user.id !== userId) // Don't notify the track creator
-                                    .map(async (user: any) => {
-                                        try {
-                                            // Get device token for circle member
-                                            const deviceToken = await getDeviceToken(user.id);
-
-                                            if (deviceToken) {
-                                                const title = 'New Track';
-                                                const body = `${userName} completed new drive`;
-
-                                                // Send push notification
-                                                await sendPushNotification(deviceToken, title, body);
-                                                console.log(`[User: ${userId}] Sent track notification to circle member ${user.id}`);
-                                            }
-                                        } catch (error) {
-                                            console.error(`[User: ${userId}] Error sending notification to circle member ${user.id}:`, error);
-                                        }
-                                    });
-
-                                await Promise.all(notificationPromises);
+                                return circleUsers;
                             }
+                            return [];
                         } catch (error) {
-                            console.error(`[User: ${userId}] Error processing circle ${circleId}:`, error);
+                            console.error(`[User: ${userId}] Error fetching circle ${circleId}:`, error);
+                            return [];
                         }
                     });
 
-                    await Promise.all(circlePromises);
+                    const circleUsersArrays = await Promise.all(circlePromises);
+
+                    // Combine all users from all circles and deduplicate by userId
+                    const allUsersMap = new Map<string, CircleUser>();
+                    for (const usersArray of circleUsersArrays) {
+                        for (const user of usersArray) {
+                            if (user && user.id) {
+                                allUsersMap.set(user.id, user);
+                            }
+                        }
+                    }
+
+                    const uniqueUsers = Array.from(allUsersMap.values());
+                    console.log(`[User: ${userId}] Found ${uniqueUsers.length} unique users across ${circleIds.length} circles`);
+
+                    // Check notification settings and send alerts to all unique users (including track creator if enabled)
+                    const notificationPromises = uniqueUsers.map(async (circleUser: CircleUser) => {
+                        try {
+                            // Check if notificationSettings document exists
+                            const notificationSettingsRef = db.collection('users').doc(circleUser.id).collection('notificationSettings');
+                            const notificationSettingsSnapshot = await notificationSettingsRef.get();
+
+                            let shouldSendAlert = false;
+
+                            if (notificationSettingsSnapshot.empty) {
+                                // No notificationSettings collection exists, send alert (default to enabled)
+                                shouldSendAlert = true;
+                                console.log(`[User: ${userId}] No notificationSettings found for user ${circleUser.id}, will send driving alert`);
+                            } else {
+                                // Check if any document has drivingAlert = false (explicitly disabled)
+                                let drivingAlertDisabled = false;
+                                for (const settingsDoc of notificationSettingsSnapshot.docs) {
+                                    const settingsData = settingsDoc.data();
+                                    if (settingsData.drivingAlert === false) {
+                                        drivingAlertDisabled = true;
+                                        console.log(`[User: ${userId}] User ${circleUser.id} has drivingAlert disabled`);
+                                        break;
+                                    }
+                                }
+                                // Send alert if not explicitly disabled
+                                shouldSendAlert = !drivingAlertDisabled;
+                            }
+
+                            if (shouldSendAlert) {
+                                // Get device token for circle member
+                                const deviceToken = await getDeviceToken(circleUser.id);
+
+                                if (deviceToken) {
+                                    const title = 'New Track';
+                                    const body = `${userName} completed new drive`;
+
+                                    // Send push notification
+                                    await sendPushNotification(deviceToken, title, body);
+                                    console.log(`[User: ${userId}] Sent track notification to circle member ${circleUser.id}`);
+                                }
+                            } else {
+                                console.log(`[User: ${userId}] Skipping track notification to user ${circleUser.id} - drivingAlert disabled`);
+                            }
+                        } catch (error) {
+                            console.error(`[User: ${userId}] Error sending notification to circle member ${circleUser.id}:`, error);
+                        }
+                    });
+
+                    await Promise.all(notificationPromises);
                 }
 
                 // Log the calculated metrics
