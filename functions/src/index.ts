@@ -4,6 +4,7 @@ import {initializeApp} from 'firebase-admin/app';
 import {getFirestore, Timestamp} from 'firebase-admin/firestore';
 import {onDocumentCreated, onDocumentDeleted, onDocumentUpdated} from 'firebase-functions/v2/firestore';
 import {onSchedule} from 'firebase-functions/v2/scheduler';
+import {onCall, HttpsError} from 'firebase-functions/v2/https';
 import {defineSecret} from 'firebase-functions/params';
 // import {onCustomEventPublished} from "firebase-functions/v2/eventarc";
 import * as admin from 'firebase-admin';
@@ -224,17 +225,38 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
 // }
 
 /**
- * deletes and entire sub collection
+ * deletes and entire sub collection in batches to avoid memory issues
  * @param {FirebaseFirestore.CollectionReference} collectionRef The collection reference
+ * @param {number} batchSize The number of documents to delete per batch (default: 500)
  */
-async function deleteSubCollection(collectionRef: admin.firestore.CollectionReference): Promise<void> {
-    const snapshot = await collectionRef.get();
-    await Promise.all(snapshot.docs.map(async (doc: admin.firestore.QueryDocumentSnapshot) => {
-        await doc.ref.delete();
-        console.log(`Deleted document ${doc.id} from sub-collection.`);
-    }));
+async function deleteSubCollection(collectionRef: admin.firestore.CollectionReference, batchSize = 500): Promise<void> {
+    let hasMore = true;
+    let deletedCount = 0;
 
-    Promise.resolve();
+    while (hasMore) {
+        // Get a batch of documents (limit to batchSize)
+        const snapshot = await collectionRef.limit(batchSize).get();
+
+        if (snapshot.empty) {
+            hasMore = false;
+            break;
+        }
+
+        // Delete documents in parallel (but in smaller batches to avoid memory issues)
+        const deletePromises = snapshot.docs.map(async (doc: admin.firestore.QueryDocumentSnapshot) => {
+            await doc.ref.delete();
+        });
+
+        await Promise.all(deletePromises);
+        deletedCount += snapshot.docs.length;
+
+        // If we got fewer documents than the batch size, we're done
+        if (snapshot.docs.length < batchSize) {
+            hasMore = false;
+        }
+    }
+
+    console.log(`Deleted ${deletedCount} documents from sub-collection.`);
 }
 
 /**
@@ -1467,7 +1489,7 @@ async function processTrackWithGoogleRoutes(userId: string, trackId: string, tra
 
             await trackRef.update({
                 routesProcessingFailed: true,
-                routesProcessingError: `Invalid API response: No routes found`,
+                routesProcessingError: 'Invalid API response: No routes found',
                 routesProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
             return;
@@ -2505,3 +2527,175 @@ export const onTrackPraiseAdded = onDocumentUpdated(
         }
     }
 );
+
+/**
+ * Callable function to delete a user account and all associated data
+ * This function:
+ * 1. Removes user from circles (or deletes circles if user is owner)
+ * 2. Deletes all user subcollections
+ * 3. Deletes the user document
+ * 4. Deletes the Firebase Auth account
+ */
+export const deleteUserAccount = onCall(async (request) => {
+    const userId = request.auth?.uid;
+    if (!userId) {
+        throw new HttpsError(
+            'unauthenticated',
+            'User must be authenticated to delete account'
+        );
+    }
+    console.log(`[DeleteAccount] Starting deletion for user: ${userId}`);
+    try {
+        // Get user document to retrieve circleIds
+        const userDocRef = db.collection('users').doc(userId);
+        const userDoc = await userDocRef.get();
+        if (!userDoc.exists) {
+            console.log(`[DeleteAccount] User document does not exist for userId: ${userId}`);
+            // Still try to delete auth account
+            await admin.auth().deleteUser(userId);
+            return {success: true, message: 'User account deleted (document did not exist)'};
+        }
+        const userData = userDoc.data();
+        const circleIds: string[] = userData?.circleIds || [];
+        console.log(`[DeleteAccount] User has ${circleIds.length} circles in circleIds array: ${JSON.stringify(circleIds)}`);
+
+        // Also find circles where user is the owner (in case circleIds array is out of sync)
+        const ownedCirclesSnapshot = await db.collection('circles')
+            .where('ownerId', '==', userId)
+            .get();
+
+        const ownedCircleIds = ownedCirclesSnapshot.docs.map((doc) => doc.id);
+        console.log(`[DeleteAccount] Found ${ownedCircleIds.length} circles where user is owner: ${JSON.stringify(ownedCircleIds)}`);
+
+        // Combine both lists and remove duplicates
+        const allCircleIds = [...new Set([...circleIds, ...ownedCircleIds])];
+        console.log(`[DeleteAccount] Processing ${allCircleIds.length} total circles`);
+
+        // Process each circle
+        await Promise.all(allCircleIds.map(async (circleId) => {
+            try {
+                const circleDocRef = db.collection('circles').doc(circleId);
+                const circleDoc = await circleDocRef.get();
+
+                if (!circleDoc.exists) {
+                    console.log(`[DeleteAccount] Circle ${circleId} does not exist, skipping`);
+                    return;
+                }
+
+                const circleData = circleDoc.data();
+                const ownerId = circleData?.ownerId;
+
+                console.log(`[DeleteAccount] Processing circle ${circleId}, ownerId: ${ownerId}, userId: ${userId}`);
+
+                if (ownerId === userId) {
+                    // User owns the circle - delete the entire circle
+                    console.log(`[DeleteAccount] User owns circle ${circleId}, deleting circle`);
+                    try {
+                        await circleDocRef.delete();
+                        console.log(`[DeleteAccount] Successfully deleted circle ${circleId}`);
+                        // onCircleDeleted trigger will handle cleanup
+                    } catch (deleteError) {
+                        console.error(`[DeleteAccount] Failed to delete circle ${circleId}:`, deleteError);
+                        throw deleteError; // Re-throw to be caught by outer catch
+                    }
+                } else {
+                    // User is a member - remove from circle
+                    console.log(`[DeleteAccount] User is member of circle ${circleId}, removing from circle`);
+                    const circleUsersRef = circleDocRef.collection('users').doc(userId);
+                    await circleUsersRef.delete();
+                    // onCircleUserDeleted trigger will handle updating other users' circleIds
+
+                    // Also update the circle's users array
+                    const users = circleData?.users || [];
+                    const updatedUsers = users.filter((user: CircleUser) => user.id !== userId);
+                    await circleDocRef.update({users: updatedUsers});
+                    console.log(`[DeleteAccount] Successfully removed user from circle ${circleId}`);
+                }
+            } catch (error) {
+                console.error(`[DeleteAccount] Error processing circle ${circleId}:`, error);
+                // Continue with other circles even if one fails
+            }
+        }));
+
+        // Delete all user subcollections sequentially to reduce memory usage
+        console.log(`[DeleteAccount] Deleting user subcollections for userId: ${userId}`);
+
+        const subcollections = [
+            'liveTracks',
+            'tracks',
+            'notifications',
+            'notificationSettings',
+            'namedPlaces',
+            'dailyMetrics',
+        ];
+
+        // Process subcollections sequentially to avoid memory issues
+        for (const subcollectionName of subcollections) {
+            try {
+                const subcollectionRef = db.collection(`users/${userId}/${subcollectionName}`);
+
+                // Check if collection has documents (using a small limit to avoid loading all)
+                const checkSnapshot = await subcollectionRef.limit(1).get();
+
+                if (checkSnapshot.empty) {
+                    console.log(`[DeleteAccount] Subcollection ${subcollectionName} is empty, skipping`);
+                    continue;
+                }
+
+                console.log(`[DeleteAccount] Starting deletion of subcollection: ${subcollectionName}`);
+
+                // For liveTracks, also delete nested locations subcollections
+                if (subcollectionName === 'liveTracks') {
+                    // Delete liveTracks in batches
+                    let hasMoreTracks = true;
+                    while (hasMoreTracks) {
+                        const tracksSnapshot = await subcollectionRef.limit(50).get();
+                        if (tracksSnapshot.empty) {
+                            hasMoreTracks = false;
+                            break;
+                        }
+
+                        // Process each track and its locations
+                        await Promise.all(tracksSnapshot.docs.map(async (doc) => {
+                            const locationsRef = doc.ref.collection('locations');
+                            await deleteSubCollection(locationsRef, 200); // Smaller batch for nested collections
+                            await doc.ref.delete();
+                        }));
+
+                        if (tracksSnapshot.docs.length < 50) {
+                            hasMoreTracks = false;
+                        }
+                    }
+                } else {
+                    // For other subcollections, delete in batches
+                    // Use smaller batch size for notifications to avoid memory issues
+                    const batchSize = subcollectionName === 'notifications' ? 200 : 500;
+                    await deleteSubCollection(subcollectionRef, batchSize);
+                }
+
+                console.log(`[DeleteAccount] Deleted subcollection: ${subcollectionName}`);
+            } catch (error) {
+                console.error(`[DeleteAccount] Error deleting subcollection ${subcollectionName}:`, error);
+                // Continue with other subcollections even if one fails
+            }
+        }
+
+        // Delete the main user document
+        console.log(`[DeleteAccount] Deleting user document for userId: ${userId}`);
+        await userDocRef.delete();
+
+        // Delete Firebase Auth account
+        console.log(`[DeleteAccount] Deleting Firebase Auth account for userId: ${userId}`);
+        await admin.auth().deleteUser(userId);
+
+        console.log(`[DeleteAccount] Successfully deleted account for userId: ${userId}`);
+
+        return {success: true, message: 'User account and all associated data deleted successfully'};
+    } catch (error) {
+        console.error(`[DeleteAccount] Error deleting account for userId ${userId}:`, error);
+        throw new HttpsError(
+            'internal',
+            `Failed to delete user account: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+    }
+});
