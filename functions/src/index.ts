@@ -2699,3 +2699,195 @@ export const deleteUserAccount = onCall(async (request) => {
         );
     }
 });
+
+/**
+ * Callable function to allow a user to leave a circle
+ * User must be a member (not owner) of the circle
+ */
+export const leaveCircle = onCall(async (request) => {
+    const userId = request.auth?.uid;
+    if (!userId) {
+        throw new HttpsError(
+            'unauthenticated',
+            'User must be authenticated to leave a circle'
+        );
+    }
+
+    const {circleId} = request.data;
+    if (!circleId || typeof circleId !== 'string') {
+        throw new HttpsError(
+            'invalid-argument',
+            'circleId is required and must be a string'
+        );
+    }
+
+    console.log(`[LeaveCircle] User ${userId} attempting to leave circle ${circleId}`);
+
+    try {
+        // Get circle document
+        const circleDocRef = db.collection('circles').doc(circleId);
+        const circleDoc = await circleDocRef.get();
+
+        if (!circleDoc.exists) {
+            throw new HttpsError(
+                'not-found',
+                `Circle ${circleId} does not exist`
+            );
+        }
+
+        const circleData = circleDoc.data();
+        const ownerId = circleData?.ownerId;
+
+        // User cannot leave if they are the owner
+        if (ownerId === userId) {
+            throw new HttpsError(
+                'permission-denied',
+                'Circle owner cannot leave their own circle. Use delete instead.'
+            );
+        }
+
+        // Check if user is a member of the circle
+        const users = circleData?.users || [];
+        const userIndex = users.findIndex((user: any) => user.id === userId);
+
+        if (userIndex === -1) {
+            throw new HttpsError(
+                'permission-denied',
+                'User is not a member of this circle'
+            );
+        }
+
+        // Use batch for atomic operation
+        const batch = db.batch();
+
+        // Remove user from circle's users array
+        const updatedUsers = users.filter((user: any) => user.id !== userId);
+        batch.update(circleDocRef, {users: updatedUsers});
+
+        // Update user's circleIds array
+        const userDocRef = db.collection('users').doc(userId);
+        const userDoc = await userDocRef.get();
+
+        if (userDoc.exists) {
+            const userData = userDoc.data();
+            const circleIds = userData?.circleIds || [];
+            const updatedCircleIds = circleIds.filter((id: string) => id !== circleId);
+            batch.update(userDocRef, {circleIds: updatedCircleIds});
+        }
+
+        // Commit the batch
+        await batch.commit();
+
+        console.log(`[LeaveCircle] Successfully removed user ${userId} from circle ${circleId}`);
+        return {success: true, message: 'Successfully left circle'};
+    } catch (error) {
+        console.error(`[LeaveCircle] Error leaving circle ${circleId} for user ${userId}:`, error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError(
+            'internal',
+            `Failed to leave circle: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+    }
+});
+
+/**
+ * Callable function to delete a circle with user removal
+ * Only the circle owner can delete, and they must have at least 2 circles
+ */
+export const deleteCircleWithUserRemoval = onCall(async (request) => {
+    const userId = request.auth?.uid;
+    if (!userId) {
+        throw new HttpsError(
+            'unauthenticated',
+            'User must be authenticated to delete a circle'
+        );
+    }
+
+    const {circleId} = request.data;
+    if (!circleId || typeof circleId !== 'string') {
+        throw new HttpsError(
+            'invalid-argument',
+            'circleId is required and must be a string'
+        );
+    }
+
+    console.log(`[DeleteCircleWithUserRemoval] User ${userId} attempting to delete circle ${circleId}`);
+
+    try {
+        // Get circle document
+        const circleDocRef = db.collection('circles').doc(circleId);
+        const circleDoc = await circleDocRef.get();
+
+        if (!circleDoc.exists) {
+            throw new HttpsError(
+                'not-found',
+                `Circle ${circleId} does not exist`
+            );
+        }
+
+        const circleData = circleDoc.data();
+        const ownerId = circleData?.ownerId;
+
+        // Verify user is the owner
+        if (ownerId !== userId) {
+            throw new HttpsError(
+                'permission-denied',
+                'Only the circle owner can delete the circle'
+            );
+        }
+
+        // Check if owner has at least 2 circles
+        const ownedCirclesSnapshot = await db.collection('circles')
+            .where('ownerId', '==', userId)
+            .get();
+
+        if (ownedCirclesSnapshot.size < 2) {
+            throw new HttpsError(
+                'failed-precondition',
+                'Owner must have at least 2 circles to delete one'
+            );
+        }
+
+        // Get all users in the circle (excluding owner)
+        const users = circleData?.users || [];
+        const usersToRemove = users.filter((user: any) => user.id !== userId);
+
+        console.log(`[DeleteCircleWithUserRemoval] Removing ${usersToRemove.length} users from circle before deletion`);
+
+        // Use batch for atomic operation
+        const batch = db.batch();
+
+        // Remove circleId from each user's circleIds array
+        for (const userToRemove of usersToRemove) {
+            const userDocRef = db.collection('users').doc(userToRemove.id);
+            const userDoc = await userDocRef.get();
+
+            if (userDoc.exists) {
+                const userData = userDoc.data();
+                const circleIds = userData?.circleIds || [];
+                const updatedCircleIds = circleIds.filter((id: string) => id !== circleId);
+                batch.update(userDocRef, {circleIds: updatedCircleIds});
+            }
+        }
+
+        // Delete the circle document (this will trigger onCircleDeleted)
+        batch.delete(circleDocRef);
+
+        // Commit the batch
+        await batch.commit();
+
+        console.log(`[DeleteCircleWithUserRemoval] Successfully deleted circle ${circleId} and removed all users`);
+        return {success: true, message: 'Successfully deleted circle and removed all users'};
+    } catch (error) {
+        console.error(`[DeleteCircleWithUserRemoval] Error deleting circle ${circleId} for user ${userId}:`, error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError(
+            'internal',
+            `Failed to delete circle: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+    }
+});
