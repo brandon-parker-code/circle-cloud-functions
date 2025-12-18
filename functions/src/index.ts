@@ -445,6 +445,82 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
     return Promise.resolve();
 });
 
+/**
+ * Triggers when a circle document is updated
+ * Detects when a new user is added to the circle and sends notifications to all members
+ */
+export const onCircleUpdated = onDocumentUpdated('circles/{circleId}', async (event) => {
+    const circleId = event.params.circleId;
+
+    if (!event.data) {
+        console.log(`Circle document with ID ${circleId} has no data in update event, skipping`);
+        return;
+    }
+
+    const beforeData = event.data.before.data();
+    const afterData = event.data.after.data();
+
+    console.log(`Circle document with ID ${circleId} was updated.`);
+
+    try {
+        // Check if users array exists in both before and after
+        const beforeUsers: CircleUser[] = beforeData?.users || [];
+        const afterUsers: CircleUser[] = afterData?.users || [];
+
+        // Find newly added users by comparing arrays
+        const beforeUserIds = new Set(beforeUsers.map((user: CircleUser) => user.id));
+        const newUsers = afterUsers.filter((user: CircleUser) => !beforeUserIds.has(user.id));
+
+        // Only proceed if new users were added
+        if (newUsers.length === 0) {
+            console.log(`No new users added to circle ${circleId}`);
+            return Promise.resolve();
+        }
+
+        console.log(`New users added to circle ${circleId}: ${newUsers.map((u: CircleUser) => u.id).join(', ')}`);
+
+        // Get circle name
+        const circleName = afterData?.name || 'the circle';
+
+        // Process each new user
+        for (const newUser of newUsers) {
+            try {
+                // Get the new member's name
+                const newMemberDoc = await db.collection('users').doc(newUser.id).get();
+                const newMemberData = newMemberDoc.data();
+                const newMemberName = newMemberData?.name || 'Someone';
+
+                console.log(`New member ${newMemberName} (${newUser.id}) joined circle ${circleName}`);
+
+                // Send notifications to all circle members (including the new member)
+                const notificationPromises = afterUsers.map(async (circleUser: CircleUser) => {
+                    try {
+                        const deviceToken = await getDeviceToken(circleUser.id);
+                        if (deviceToken) {
+                            const title = 'New Member Joined';
+                            const body = `${newMemberName} joined ${circleName}`;
+                            await sendPushNotification(deviceToken, title, body);
+                            console.log(`Sent join notification to ${circleUser.id} about ${newMemberName} joining ${circleName}`);
+                        } else {
+                            console.log(`No device token found for user ${circleUser.id}, skipping notification`);
+                        }
+                    } catch (error) {
+                        console.error(`Error sending notification to circle member ${circleUser.id}:`, error);
+                    }
+                });
+
+                await Promise.all(notificationPromises);
+            } catch (error) {
+                console.error(`Error processing new user ${newUser.id} for circle ${circleId}:`, error);
+            }
+        }
+    } catch (error) {
+        console.error(`Error during circle update operation for circleId: ${circleId}`, error);
+    }
+
+    return Promise.resolve();
+});
+
 
 export const onLocationEventCreated = onDocumentCreated('locationEvents/{id}', async (event) => {
     const snapshot = event.data;
