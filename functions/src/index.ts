@@ -399,35 +399,30 @@ export const onCircleUserDeleted = onDocumentDeleted('circles/{circleId}/users/{
     const userId = event.params.userId;
     const deletedData = event.data?.data();
 
-    console.log(`Circle User document with circleId ${circleId} and userId ${userId} was deleted.`);
-    console.log('Deleted data:', deletedData);
+    console.log(`[onCircleUserDeleted] Circle User document with circleId ${circleId} and userId ${userId} was deleted.`);
+    console.log('[onCircleUserDeleted] Deleted data:', deletedData);
 
     try {
-        // Query all users to check if their 'circles' sub-collection has any document referencing the deleted circleId
-        const usersSnapshot = await db.collection('users').get();
+        // Only update the specific user who was removed from the circle
+        const userDocRef = db.collection('users').doc(userId);
+        const userDoc = await userDocRef.get();
 
-        // Use Promise.all to process all users and their sub-collection deletions asynchronously
-        await Promise.all(usersSnapshot.docs.map(async (userDoc) => {
-            // Check the 'circles' sub-collection for matching documents
-            // const circles2Ref = userDoc.ref.collection('circles').where('circleId', '==', circleId);
-            // const circles2Snapshot = await circles2Ref.get();
-
-
-            // Check the 'circleIds' list for matching documents
+        if (userDoc.exists) {
             const userData = userDoc.data();
-            const circleIds = userData.circleIds;
-            const newCircleIds = circleIds.filter((i: string) => i !== circleId);
+            const circleIds = userData?.circleIds || [];
 
-            console.log(`User: ${userId} current circleIds ${circleIds} new circleIds ${newCircleIds}`);
-            userDoc.ref.update({circleIds: newCircleIds});
-            console.log(`User: ${userId} circleIds updated`);
-
-            // // Loop over the found 'circles' documents and delete them
-            // await Promise.all(circles2Snapshot.docs.map(async (circles2Doc) => {
-            //     await circles2Doc.ref.delete();
-            //     console.log(`Related 'users/circles' document with ID ${circles2Doc.id} deleted.`);
-            // }));
-        }));
+            // Only remove the circleId if it exists in the array
+            if (circleIds.includes(circleId)) {
+                const newCircleIds = circleIds.filter((id: string) => id !== circleId);
+                console.log(`[onCircleUserDeleted] User ${userId} current circleIds: ${JSON.stringify(circleIds)}, new circleIds: ${JSON.stringify(newCircleIds)}`);
+                await userDocRef.update({circleIds: newCircleIds});
+                console.log(`[onCircleUserDeleted] User ${userId} circleIds updated successfully`);
+            } else {
+                console.log(`[onCircleUserDeleted] User ${userId} circleIds array does not contain ${circleId}, skipping update`);
+            }
+        } else {
+            console.log(`[onCircleUserDeleted] User document ${userId} does not exist, skipping circleIds update`);
+        }
 
         // Get the user document where the userId matches
         const deviceToken = await getDeviceToken(userId);
