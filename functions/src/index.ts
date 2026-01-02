@@ -195,34 +195,85 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
 /**
  * Sends a Silent Push Notification to the device
  * @param {string} deviceToken The users deviceToken
- * @param {string} content data content
- * @return {Promise<string> | null} The deviceToken or null
+ * @param {string} content data content (JSON string)
+ * @return {Promise<string | null>} The message ID or null
  */
-// async function sendSilentPushNotification(deviceToken: string, content: string): Promise<string | null> {
-//     if (deviceToken) {
-//         const message = {
-//             token: deviceToken,
-//             apns: {
-//                 headers: {
-//                     'apns-push-type': 'background',
-//                     'apns-priority': '5',
-//                     // No apns-topic needed - Firebase auto-detects!
-//                 },
-//                 payload: {
-//                     aps: {
-//                         'content-available': 1,
-//                     },
-//                     shouldTrack: true,
-//                     timestamp: Date.now(),
-//                 },
-//             },
-//         };
+async function sendSilentPushNotification(deviceToken: string, content: string): Promise<string | null> {
+    if (!deviceToken) {
+        console.warn('sendSilentPushNotification: No device token provided');
+        return null;
+    }
 
-//         console.log(JSON.stringify(message, null, 2));
-//         return await admin.messaging().send(message);
-//     }
-//     return null;
-// }
+    // Validate token format (FCM tokens are typically long strings)
+    if (deviceToken.length < 50) {
+        console.warn(`sendSilentPushNotification: Token appears invalid (too short: ${deviceToken.length} chars). Token: ${deviceToken.substring(0, 20)}...`);
+    }
+
+    try {
+        // Parse content JSON to extract custom data fields
+        let customData: Record<string, string> = {};
+        try {
+            const parsedContent = JSON.parse(content);
+            customData = {
+                action: parsedContent.action || 'refresh',
+                timestamp: parsedContent.timestamp || Date.now().toString(),
+                shouldTrack: parsedContent.shouldTrack?.toString() || 'true',
+            };
+        } catch (parseError) {
+            // If content is not valid JSON, use defaults
+            console.warn('sendSilentPushNotification: Failed to parse content JSON, using defaults:', parseError);
+            customData = {
+                action: 'refresh',
+                timestamp: Date.now().toString(),
+                shouldTrack: 'true',
+            };
+        }
+
+        const message = {
+            token: deviceToken,
+            data: customData,
+            apns: {
+                headers: {
+                    'apns-push-type': 'background',
+                    'apns-priority': '5',
+                },
+                payload: {
+                    aps: {
+                        'content-available': 1,
+                    },
+                },
+            },
+            // Add Android config to prevent errors (even though we're targeting iOS)
+            android: {
+                priority: 'normal' as const,
+            },
+        };
+
+        console.log('sendSilentPushNotification: Sending silent notification to token:', deviceToken.substring(0, 20) + '...');
+        console.log('sendSilentPushNotification: Message payload:', JSON.stringify(message, null, 2));
+
+        const messageId = await admin.messaging().send(message);
+        console.log('sendSilentPushNotification: ✅ Successfully sent notification, message ID:', messageId);
+        return messageId;
+    } catch (error: unknown) {
+        // Log detailed error information
+        console.error('sendSilentPushNotification: ❌ Error sending silent notification');
+        const err = error as {constructor?: {name?: string}; message?: string; code?: string};
+        console.error('sendSilentPushNotification: Error type:', err?.constructor?.name);
+        console.error('sendSilentPushNotification: Error message:', err?.message);
+        console.error('sendSilentPushNotification: Error code:', err?.code);
+        console.error('sendSilentPushNotification: Full error:', JSON.stringify(error, null, 2));
+
+        // Check for specific Firebase errors
+        if (err?.code === 'messaging/invalid-registration-token' || err?.code === 'messaging/registration-token-not-registered') {
+            console.error('sendSilentPushNotification: ⚠️ Invalid or unregistered token - token may need to be refreshed');
+        } else if (err?.code === 'messaging/invalid-argument') {
+            console.error('sendSilentPushNotification: ⚠️ Invalid argument in message payload');
+        }
+
+        return null;
+    }
+}
 
 /**
  * deletes and entire sub collection in batches to avoid memory issues
@@ -2116,66 +2167,127 @@ export const expireOldLiveTracks = onSchedule({
     }
 });
 
-// export const scheduledFunction = onSchedule({
-//     schedule: 'every 15 minutes',
-//     timeZone: 'UTC',
-// }, async () => {
-//     console.log('Scheduled function triggered at:', new Date().toISOString());
+export const scheduledFunction = onSchedule({
+    schedule: 'every 30 minutes',
+    timeZone: 'UTC',
+}, async () => {
+    console.log('scheduledFunction: Triggered at:', new Date().toISOString());
 
-//     try {
-//         // Get all users from the users collection
-//         const usersSnapshot = await db.collection('users').get();
+    try {
+        // Get all users from the users collection
+        const usersSnapshot = await db.collection('users').get();
 
-//         if (usersSnapshot.empty) {
-//             console.log('No users found in the database');
-//             return;
-//         }
+        if (usersSnapshot.empty) {
+            console.log('scheduledFunction: No users found in the database');
+            return;
+        }
 
-//         console.log(`Found ${usersSnapshot.size} users to process`);
+        console.log(`scheduledFunction: Found ${usersSnapshot.size} users to process`);
 
-//         // Process each user and send a silent notification
-//         const notificationPromises = usersSnapshot.docs.map(async (userDoc) => {
-//             const userData = userDoc.data();
-//             const userId = userData.userId;
+        let successCount = 0;
+        let failureCount = 0;
+        let skippedCount = 0;
 
-//             if (!userId) {
-//                 console.log(`User document ${userDoc.id} has no userId field, skipping`);
-//                 return;
-//             }
+        // Process each user and send a silent notification
+        // Process in batches to avoid rate limits (batch size of 100)
+        const batchSize = 100;
+        const userDocs = usersSnapshot.docs;
 
-//             // Get the device token for this user
-//             const deviceToken = await getDeviceToken(userId);
+        for (let i = 0; i < userDocs.length; i += batchSize) {
+            const batch = userDocs.slice(i, i + batchSize);
+            console.log(`scheduledFunction: Processing batch ${Math.floor(i / batchSize) + 1} (${batch.length} users)`);
 
-//             if (!deviceToken) {
-//                 console.log(`No device token found for user ${userId}, skipping notification`);
-//                 return;
-//             }
+            const notificationPromises = batch.map(async (userDoc) => {
+                try {
+                    const userData = userDoc.data();
+                    const userId = userData.userId;
 
-//             // Create notification content
-//             const content = JSON.stringify({
-//                 action: 'refresh',
-//                 timestamp: new Date().toISOString(),
-//             });
+                    if (!userId) {
+                        console.log(`scheduledFunction: User document ${userDoc.id} has no userId field, skipping`);
+                        skippedCount++;
+                        return;
+                    }
 
-//             // Send the silent notification
-//             const result = await sendSilentPushNotification(deviceToken, content);
+                    // Get the device token for this user
+                    const deviceToken = await getDeviceToken(userId);
 
-//             if (result) {
-//                 console.log(`Successfully sent silent notification to user ${userId}`);
-//             } else {
-//                 console.log(`Failed to send silent notification to user ${userId}`);
-//             }
-//         });
+                    if (!deviceToken) {
+                        console.log(`scheduledFunction: No device token found for user ${userId}, skipping notification`);
+                        skippedCount++;
+                        return;
+                    }
 
-//         // Wait for all notifications to be sent
-//         await Promise.all(notificationPromises);
+                    // Validate token format
+                    if (deviceToken.length < 50) {
+                        console.warn(`scheduledFunction: ⚠️ Token for user ${userId} appears invalid (length: ${deviceToken.length}). Token: ${deviceToken.substring(0, 20)}...`);
+                    } else {
+                        console.log(`scheduledFunction: ✅ Valid token found for user ${userId} (length: ${deviceToken.length})`);
+                    }
 
-//         console.log('Scheduled function completed successfully');
-//     } catch (error) {
-//         console.error('Error in scheduled function:', error);
-//         throw error;
-//     }
-// });
+                    // Check if user has active live track (track is active if endTime is null/undefined)
+                    let shouldTrack = true; // Default to true for all users
+                    try {
+                        const liveTracksSnapshot = await db.collection(`users/${userId}/liveTracks`).get();
+
+                        // Filter to find tracks where endTime is null (active tracks)
+                        const hasActiveTrack = liveTracksSnapshot.docs.some((doc) => {
+                            const data = doc.data();
+                            return !data.endTime; // Track is active if endTime is null/undefined
+                        });
+
+                        if (hasActiveTrack) {
+                            // User has active track
+                            shouldTrack = true;
+                            console.log(`scheduledFunction: User ${userId} has active track(s) - setting shouldTrack: true`);
+                        } else {
+                            // No active track, but still send notification to maintain tracking state
+                            shouldTrack = true;
+                            console.log(`scheduledFunction: User ${userId} has no active tracks - still sending notification for state maintenance`);
+                        }
+                    } catch (trackError) {
+                        console.error(`scheduledFunction: Error checking active tracks for user ${userId}:`, trackError);
+                        // Default to true on error to ensure tracking continues
+                        shouldTrack = true;
+                    }
+
+                    // Create notification content
+                    const content = JSON.stringify({
+                        action: 'refresh',
+                        timestamp: new Date().toISOString(),
+                        shouldTrack: shouldTrack,
+                    });
+
+                    // Send the silent notification
+                    const result = await sendSilentPushNotification(deviceToken, content);
+
+                    if (result) {
+                        console.log(`scheduledFunction: Successfully sent silent notification to user ${userId}, message ID: ${result}`);
+                        successCount++;
+                    } else {
+                        console.log(`scheduledFunction: Failed to send silent notification to user ${userId}`);
+                        failureCount++;
+                    }
+                } catch (error) {
+                    console.error(`scheduledFunction: Error processing user ${userDoc.id}:`, error);
+                    failureCount++;
+                }
+            });
+
+            // Wait for current batch to complete before processing next batch
+            await Promise.all(notificationPromises);
+
+            // Small delay between batches to avoid rate limits
+            if (i + batchSize < userDocs.length) {
+                await new Promise((resolve) => setTimeout(resolve, 1000)); // 1 second delay
+            }
+        }
+
+        console.log(`scheduledFunction: Completed successfully. Success: ${successCount}, Failed: ${failureCount}, Skipped: ${skippedCount}`);
+    } catch (error) {
+        console.error('scheduledFunction: Error in scheduled function:', error);
+        throw error;
+    }
+});
 
 /**
  * Scheduled function that runs every 20 minutes to check user activity
